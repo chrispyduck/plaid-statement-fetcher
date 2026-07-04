@@ -26,3 +26,5 @@ This consists of two main components:
 
 * Configuration is stored in one JSON file
 * List of downloaded statements is stored in another JSON file
+* primarily intended to be deployed on a Kubernetes cluster: includes  Kustomization with Deloyment, Service, Ingres, ConfigMap, and Secrets 
+* Also usable as a local application (using localhost or an /etc/hosts file entry depending on Plaid/bank requirements) for testing and develoment
