@@ -8,7 +8,9 @@ resources:
   - pvc.yaml
 
 labels:
-  - pairs:
+  - includeSelectors: true
+    includeTemplates: true
+    pairs:
       app.kubernetes.io/name: statement-fetcher
       app.kubernetes.io/part-of: statement-fetcher
       app.kubernetes.io/component: backend

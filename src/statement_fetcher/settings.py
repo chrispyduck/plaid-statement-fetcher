@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     retry_base_delay_seconds: float = Field(default=1.0, alias="PSF_RETRY_BASE_DELAY_SECONDS")
     retry_max_delay_seconds: float = Field(default=30.0, alias="PSF_RETRY_MAX_DELAY_SECONDS")
     sync_min_interval_seconds: float = Field(default=0.35, alias="PSF_SYNC_MIN_INTERVAL_SECONDS")
+    encryption_secret: str | None = Field(default=None, alias="PSF_ENCRYPTION_SECRET")
     statements_start_date: date | None = Field(default=None, alias="PSF_STATEMENTS_START_DATE")
     statements_end_date: date | None = Field(default=None, alias="PSF_STATEMENTS_END_DATE")
 

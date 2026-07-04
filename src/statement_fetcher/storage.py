@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .crypto import decrypt_value, encrypt_value
 from .models import ConfigurationFile, DownloadedStatement, LinkedAccount, LinkedItem, StateFile
 from .settings import Settings
 
@@ -172,7 +173,10 @@ def load_configuration(settings: Settings) -> ConfigurationFile:
                 institution_name=row["institution_name"],
                 institution_logo=row["institution_logo"],
                 item_id=row["item_id"],
-                access_token=row["access_token"],
+                access_token=decrypt_value(
+                    row["access_token"],
+                    settings.encryption_secret,
+                ),
                 accounts=accounts_by_item_id.get(row["item_id"], []),
                 created_at=datetime.fromisoformat(row["created_at"]),
                 updated_at=datetime.fromisoformat(row["updated_at"]),
@@ -206,7 +210,7 @@ def save_configuration(settings: Settings, config: ConfigurationFile) -> None:
                     item.institution_id,
                     item.institution_name,
                     item.institution_logo,
-                    item.access_token,
+                    encrypt_value(item.access_token, settings.encryption_secret),
                     item.created_at.isoformat(),
                     item.updated_at.isoformat(),
                 ),
@@ -399,7 +403,7 @@ def upsert_linked_item(settings: Settings, linked_item: LinkedItem) -> None:
                 linked_item.institution_id,
                 linked_item.institution_name,
                 linked_item.institution_logo,
-                linked_item.access_token,
+                encrypt_value(linked_item.access_token, settings.encryption_secret),
                 created_at,
                 now,
             ),

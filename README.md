@@ -66,12 +66,14 @@ Core settings:
 - `PLAID_COUNTRY_CODES=US`
 - `PLAID_REDIRECT_URI=auto` or explicit callback URL
 - `PSF_CONFIG_ROOT=/app/config`
+- `PSF_ENCRYPTION_SECRET=your-long-random-secret`
 - `PSF_RETRY_MAX_ATTEMPTS=5`
 - `PSF_RETRY_BASE_DELAY_SECONDS=1`
 - `PSF_RETRY_MAX_DELAY_SECONDS=30`
 
 Notes:
 - `PLAID_ENV` is a mode flag only; state path does not branch by env.
+- `PSF_ENCRYPTION_SECRET` enables encryption at rest for sensitive persisted values.
 - Service configuration page can override selected non-secret settings at runtime.
 
 ## Local Development
@@ -155,6 +157,15 @@ Update image fields in:
 ```bash
 kubectl apply -k k8s/base
 ```
+
+Remote HTTP reference example:
+
+```bash
+kubectl apply -k k8s/examples/http-reference
+```
+
+This example uses an HTTPS GitHub reference to consume the stack and is defined in:
+- `k8s/examples/http-reference/kustomization.yaml`
 
 ### 4. Verify
 

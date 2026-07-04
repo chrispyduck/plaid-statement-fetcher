@@ -16,6 +16,57 @@ from statement_fetcher.storage import (
 )
 
 
+def test_access_token_encrypted_at_rest_when_secret_is_set(tmp_path) -> None:
+    settings = Settings(
+        plaid_env="sandbox",
+        PSF_CONFIG_ROOT=tmp_path,
+        PSF_ENCRYPTION_SECRET="test-secret",
+    )
+
+    linked_item = LinkedItem(
+        institution_id="ins_1",
+        institution_name="Bank A",
+        item_id="item_1",
+        access_token="access-plain",
+        accounts=[LinkedAccount(account_id="acc_1", account_name="Checking")],
+    )
+    upsert_linked_item(settings, linked_item)
+
+    config = load_configuration(settings)
+    assert config.linked_items[0].access_token == "access-plain"
+
+    import sqlite3
+
+    conn = sqlite3.connect(tmp_path / "state.db")
+    try:
+        row = conn.execute(
+            "SELECT access_token FROM linked_items WHERE item_id = ?",
+            ("item_1",),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert row is not None
+    assert row[0] != "access-plain"
+    assert str(row[0]).startswith("enc:v1:")
+
+
+def test_plaintext_access_token_compatibility_without_secret(tmp_path) -> None:
+    settings = Settings(plaid_env="sandbox", PSF_CONFIG_ROOT=tmp_path)
+
+    linked_item = LinkedItem(
+        institution_id="ins_1",
+        institution_name="Bank A",
+        item_id="item_1",
+        access_token="access-plain",
+        accounts=[LinkedAccount(account_id="acc_1", account_name="Checking")],
+    )
+    upsert_linked_item(settings, linked_item)
+
+    config = load_configuration(settings)
+    assert config.linked_items[0].access_token == "access-plain"
+
+
 def test_upsert_linked_item_preserves_existing_alias(tmp_path) -> None:
     settings = Settings(plaid_env="sandbox", PSF_CONFIG_ROOT=tmp_path)
 
