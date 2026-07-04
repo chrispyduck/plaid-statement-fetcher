@@ -1,30 +1,68 @@
-# Bank Statement Fetcher
+# Statement Fetcher Requirements
 
-## Purpose
+## Product Scope
 
-To fetch montly and quarterly PDF statements from my banks using the Plaid API
+Build a production-ready web application that:
+- links institutions/accounts via Plaid Link,
+- syncs and downloads account statements,
+- persists service state locally,
+- supports deployment as split frontend/backend services.
 
-## Requirements
+## Functional Requirements
 
-This consists of two main components:
-1. A configuration utility to "link" bank accounts to plaid
-2. A simple "downloader" that fetches statements from all accounts
+### Frontend
 
-### Configuration Utility
+- Home page:
+  - show linked accounts,
+  - start Plaid link flow,
+  - navigate to account management and sync pages.
+- Account details/config page:
+  - show non-secret account/institution metadata,
+  - edit alias with save feedback,
+  - remove account with explicit confirmation,
+  - show account event history.
+- Sync page:
+  - start statement sync,
+  - display job summary and detailed logs.
+- Service configuration page:
+  - edit non-secret runtime settings.
 
-* Kick off web-based plaid bank account "linking" process
-* Store any required information in a local configuration file
+### Backend API
 
-### Downloader
+- Link token create/exchange endpoints.
+- Account list/detail/alias/remove endpoints.
+- Sync start/status/jobs endpoints.
+- Event query endpoint.
+- Service config read/update endpoints.
 
-* For each "linked" account, get a list of available bank statements
-* Compare this list to a stored list of previously fetched statements
-* Download any available statements that have not been previously downloaded
-* For all successfuly downloaded statement, update the stored list of previously fetched statements
+### Persistence
 
-### Common Requirements
+- Use SQLite (single file) for:
+  - linked items/accounts,
+  - downloaded statements,
+  - events,
+  - service config overrides.
+- Store PDF outputs in filesystem under configured output root.
 
-* Configuration is stored in one JSON file
-* List of downloaded statements is stored in another JSON file
-* primarily intended to be deployed on a Kubernetes cluster: includes  Kustomization with Deloyment, Service, Ingres, ConfigMap, and Secrets 
-* Also usable as a local application (using localhost or an /etc/hosts file entry depending on Plaid/bank requirements) for testing and develoment
+## Operational Requirements
+
+- One runtime mode flag: `PLAID_ENV=sandbox|production`.
+- Backend and frontend must be containerized separately.
+- Kubernetes manifests must be split into backend/frontend components with distinct labels.
+- Ingress must route API/callback paths to backend and SPA routes to frontend.
+- Include PR validation, artifact publication, and release workflows in GitHub Actions.
+
+## Security/Compliance Baseline
+
+- No plaintext secrets in repository manifests.
+- Provide secret template and environment-based secret injection.
+- Persist runtime data on mounted storage volume in Kubernetes.
+
+## Documentation Requirements
+
+Documentation must cover:
+- local development setup,
+- runtime configuration,
+- container build/run for both services,
+- Kubernetes deployment and verification,
+- GitHub publish/release workflow.

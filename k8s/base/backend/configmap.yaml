@@ -1,13 +1,13 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: statement-fetcher-config
+  name: statement-fetcher-backend-config
 data:
   PLAID_ENV: production
   PLAID_LANGUAGE: en-US
   PLAID_PRODUCTS: statements
   PLAID_COUNTRY_CODES: US
-  PLAID_REDIRECT_URI: https://statement-fetcher.local/plaid/callback
+  PLAID_REDIRECT_URI: https://statement-fetcher.example.com/plaid/callback
   PSF_CONFIG_ROOT: /app/config
   PSF_RETRY_MAX_ATTEMPTS: "5"
   PSF_RETRY_BASE_DELAY_SECONDS: "1"

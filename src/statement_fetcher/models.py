@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -20,11 +20,12 @@ class LinkedAccount(BaseModel):
 class LinkedItem(BaseModel):
     institution_id: str
     institution_name: str
+    institution_logo: str | None = None
     item_id: str
     access_token: str
     accounts: list[LinkedAccount] = Field(default_factory=list)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class ConfigurationFile(BaseModel):
@@ -40,7 +41,7 @@ class DownloadedStatement(BaseModel):
     account_name: str
     statement_date: date
     file_path: str
-    downloaded_at: datetime = Field(default_factory=datetime.utcnow)
+    downloaded_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     dedupe_key: str
 
 

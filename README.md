@@ -1,298 +1,213 @@
 # Plaid Statement Fetcher
 
-Web application and companion CLI for linking institutions via Plaid and downloading statement PDFs for long-term personal records.
+Statement Fetcher is a split web application for linking accounts with Plaid and downloading statement PDFs.
 
-## What Is Decided
-
-- Default environment is sandbox, with easy switch to production.
-- Config/state/output are isolated per environment.
-- Link product scope: Statements only.
-- Language/locale: en-US.
-- Link flow UX should be simple and use one command for local development.
-- Project and virtual environment are managed with uv.
-- Access tokens are stored in plaintext for now.
-- Package/module name: statement_fetcher.
+- Backend: FastAPI + SQLite state store
+- Frontend: React SPA (Material UI)
+- Deployment target: Kubernetes (frontend/backend split)
+- Container publication target: GitHub Container Registry (GHCR)
 
 ## Architecture
 
-Two interfaces over one core domain layer:
+- Frontend service:
+  - Serves SPA pages (Home, Account Details, Sync Progress, Service Config)
+  - Calls backend over relative `/api` routes
+- Backend service:
+  - Plaid link token creation + exchange
+  - Linked account and alias management
+  - Statement sync orchestration + detailed event logs
+  - Runtime service configuration persistence
 
-- Web app:
-  - Handles Plaid Link callbacks.
-  - Shows linked accounts and supports alias editing.
-  - Suitable for local use and Kubernetes deployment.
-- CLI:
-  - Bootstraps and runs local web flow.
-  - Triggers statement sync jobs.
-  - Supports operational workflows.
+State is stored in `config/state.db` (SQLite) and PDFs in `config/output`.
 
-## Project Layout
-
-```text
-plaid-statement-fetcher/
-  credentials.json
-  README.md
-  pyproject.toml
-  src/
-    statement_fetcher/
-      app.py
-      cli.py
-      settings.py
-      models.py
-      storage.py
-  config/
-    sandbox/
-      output/
-      configuration.json
-      state.json
-    production/
-      output/
-      configuration.json
-      state.json
-  k8s/
-    base/
-      kustomization.yaml
-      deployment.yaml
-      service.yaml
-      ingress.yaml
-      configmap.yaml
-      secret.example.yaml
-```
-
-## Plaid API Overview
-
-Plaid integration uses two major flows:
-
-1. Link
-- App creates a link token.
-- User completes Plaid Link in browser.
-- Plaid returns a public token.
-- App exchanges public token for access token.
-- App stores item metadata and account metadata.
-
-2. Statements sync
-- App requests available statements per linked account.
-- App compares with locally stored state.
-- App downloads only missing PDFs.
-- App updates state for successful downloads.
-
-## Configuration and State
-
-### configuration.json
-
-Per-environment linked institution/account data.
-
-Minimum fields:
-- schema_version
-- environment
-- linked_items[]
-  - institution_id
-  - institution_name
-  - item_id
-  - access_token
-  - accounts[]
-    - account_id
-    - account_name
-    - account_mask
-    - account_type
-    - account_subtype
-    - alias
-
-### state.json
-
-Per-environment statement download tracking.
-
-Minimum fields:
-- schema_version
-- environment
-- downloaded_statements[]
-  - statement_id
-  - institution_name
-  - account_id
-  - account_name
-  - statement_date
-  - file_path
-  - downloaded_at
-  - dedupe_key
-
-Dedupe rule:
-- institution + account + (date OR statement_id)
-
-## File Naming Rule
-
-Statement files are human-readable and sortable by date.
-
-Format:
+## Repository Layout
 
 ```text
-YYYY-MM-DD, institution_name, account_name[, statement_id].pdf
+.
+├── Dockerfile                         # Backend image
+├── frontend/
+│   ├── Dockerfile                     # Frontend image
+│   ├── nginx.conf
+│   └── src/
+├── k8s/
+│   └── base/
+│       ├── backend/
+│       │   ├── deployment.yaml
+│       │   ├── service.yaml
+│       │   ├── configmap.yaml
+│       │   ├── secret.example.yaml
+│       │   ├── pvc.yaml
+│       │   └── kustomization.yaml
+│       ├── frontend/
+│       │   ├── deployment.yaml
+│       │   ├── service.yaml
+│       │   └── kustomization.yaml
+│       ├── ingress.yaml
+│       └── kustomization.yaml
+├── src/statement_fetcher/
+└── .github/workflows/
+    ├── pr-validation.yml
+    ├── publish-artifacts.yml
+    └── release.yml
 ```
 
-Examples:
+## Runtime Configuration
 
-```text
-2026-07-01, Chase, Sapphire Checking.pdf
-2026-07-01, Chase, Sapphire Checking, stmt_abc123.pdf
-```
+Backend reads configuration from environment variables.
 
-## Runtime Settings
+Required:
+- `PLAID_CLIENT_ID`
+- `PLAID_SECRET`
 
-Configured with pydantic_settings.
-
-Primary variables:
-
-- PLAID_ENV=sandbox|production
-- PLAID_CLIENT_ID=...
-- PLAID_SECRET=...
-- PLAID_PRODUCTS=statements
-- PLAID_COUNTRY_CODES=US
-- PLAID_LANGUAGE=en-US
-- PLAID_REDIRECT_URI=http://localhost:8765/plaid/callback
-- PSF_CONFIG_ROOT=./config
-- PSF_RETRY_MAX_ATTEMPTS=5
-- PSF_RETRY_BASE_DELAY_SECONDS=1
-- PSF_RETRY_MAX_DELAY_SECONDS=30
-
-Credential precedence:
-1. Environment variables
-2. credentials.json
-
-## Command Contract
-
-All commands use module name statement_fetcher.
-
-### Local setup
-
-```bash
-uv sync --dev
-```
-
-## Local Development Standard Procedure (uv)
-
-Use this procedure for all local development to keep environments consistent.
-
-1. Install uv (one-time)
-
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-2. Create/update the local virtual environment and install dependencies
-
-```bash
-uv sync --dev
-```
-
-3. Run lint checks
-
-```bash
-uv run ruff check .
-```
-
-4. Run auto-fix for straightforward lint issues
-
-```bash
-uv run ruff check . --fix
-```
-
-5. Run the app/CLI using the project environment
-
-```bash
-uv run statement-fetcher status --env sandbox
-uv run statement-fetcher serve --env sandbox --host 127.0.0.1 --port 8765
-```
+Core settings:
+- `PLAID_ENV=sandbox|production`
+- `PLAID_LANGUAGE=en-US`
+- `PLAID_PRODUCTS=statements`
+- `PLAID_COUNTRY_CODES=US`
+- `PLAID_REDIRECT_URI=auto` or explicit callback URL
+- `PSF_CONFIG_ROOT=/app/config`
+- `PSF_RETRY_MAX_ATTEMPTS=5`
+- `PSF_RETRY_BASE_DELAY_SECONDS=1`
+- `PSF_RETRY_MAX_DELAY_SECONDS=30`
 
 Notes:
-- `.venv` is managed by uv and ignored in git.
-- Prefer `uv run ...` instead of activating `.venv` manually.
+- `PLAID_ENV` is a mode flag only; state path does not branch by env.
+- Service configuration page can override selected non-secret settings at runtime.
 
-### Initialize local files
+## Local Development
 
-```bash
-uv run statement-fetcher init --env sandbox
-uv run statement-fetcher init --env production
-```
-
-### One-command local link flow
-
-Starts app, opens browser, completes Link, then returns account list page where aliases can be edited.
+### Backend
 
 ```bash
-uv run statement-fetcher link start --env sandbox
-```
-
-### List linked accounts
-
-```bash
-uv run statement-fetcher link list --env sandbox
-```
-
-### Remove links
-
-By account:
-
-```bash
-uv run statement-fetcher link remove --env sandbox --account-id <account_id>
-```
-
-By institution:
-
-```bash
-uv run statement-fetcher link remove --env sandbox --institution-id <institution_id>
-```
-
-### Sync statements
-
-```bash
-uv run statement-fetcher fetch --env sandbox
-uv run statement-fetcher fetch --env production --dry-run
-```
-
-Behavior:
-- Downloads all historical statements not already in state.
-- Continues on errors.
-- Retries transient failures with exponential backoff and jitter, max 5 attempts.
-
-### Run web app directly
-
-```bash
+uv sync --dev
 uv run statement-fetcher serve --env sandbox --host 127.0.0.1 --port 8765
+```
+
+### Frontend
+
+```bash
+cd frontend
+npm ci
+npm run dev
+```
+
+Use `frontend/.env.example` to create local env overrides if needed.
+
+## Docker
+
+### Backend image
+
+```bash
+docker build -t statement-fetcher-backend:local -f Dockerfile .
+```
+
+Run:
+
+```bash
+docker run --rm -p 8765:8765 \
+  -e PLAID_ENV=production \
+  -e PLAID_CLIENT_ID=... \
+  -e PLAID_SECRET=... \
+  -v $(pwd)/config:/app/config \
+  statement-fetcher-backend:local
+```
+
+### Frontend image
+
+```bash
+docker build -t statement-fetcher-frontend:local -f frontend/Dockerfile frontend
+```
+
+Run:
+
+```bash
+docker run --rm -p 8080:8080 statement-fetcher-frontend:local
 ```
 
 ## Kubernetes Deployment
 
-Base manifests are provided under k8s/base.
+The base uses split components with distinct labels:
+- `app.kubernetes.io/component=backend`
+- `app.kubernetes.io/component=frontend`
 
-Included:
-- Deployment
-- Service
-- Ingress
-- ConfigMap
-- Secret template
-- Kustomization
+Ingress routes:
+- `/api`, `/healthz`, `/plaid` -> backend service
+- `/` -> frontend service
 
-Apply example:
+### 1. Configure secrets
+
+Create backend secret from template:
+
+```bash
+cp k8s/base/backend/secret.example.yaml /tmp/statement-fetcher-secret.yaml
+# edit PLAID_CLIENT_ID and PLAID_SECRET
+kubectl apply -f /tmp/statement-fetcher-secret.yaml
+```
+
+### 2. Set image references
+
+Update image fields in:
+- `k8s/base/backend/deployment.yaml`
+- `k8s/base/frontend/deployment.yaml`
+
+### 3. Deploy
 
 ```bash
 kubectl apply -k k8s/base
 ```
 
-Notes:
-- For production, use a real HTTPS domain and update Plaid redirect URI accordingly.
-- Do not store real secrets in repository YAML files.
+### 4. Verify
 
-## Why Web App For Linking
+```bash
+kubectl get deploy,svc,ingress
+kubectl rollout status deploy/statement-fetcher-backend
+kubectl rollout status deploy/statement-fetcher-frontend
+```
 
-Plaid Link is institution-centric and often returns multiple accounts per institution. The web flow therefore:
+## GitHub Publication and Release
 
-1. Completes one institution link session.
-2. Displays all linked accounts from that session.
-3. Allows alias assignment for each account.
-4. Stores aliases in configuration for later filename/display use.
+Workflows:
+- `PR Validation` (`.github/workflows/pr-validation.yml`)
+  - Backend lint/tests
+  - Frontend build
+  - Backend/frontend container build (no push)
+  - Kustomize render check
+- `Publish Artifacts` (`.github/workflows/publish-artifacts.yml`)
+  - On `main` pushes, publishes backend/frontend images to GHCR
+  - Uploads rendered Kubernetes manifests as workflow artifact
+- `Release` (`.github/workflows/release.yml`)
+  - On `v*` tags, publishes versioned + latest images
+  - Creates GitHub release with:
+    - rendered manifest bundle
+    - k8s base tarball
+    - checksums
 
-## Security TODO
+### Required GitHub permissions/secrets
 
-- TODO: Encrypt access tokens or move to managed secret store.
-- TODO: Add optional key rotation workflow.
-- TODO: Add optional downstream document-management export integration.
+- `GITHUB_TOKEN` with package write permission (workflow permissions already set)
+- No extra registry secret is needed for GHCR in the same repo/org when using `GITHUB_TOKEN`
 
+### Release process
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+This triggers the `Release` workflow.
+
+## Using the Service
+
+1. Open frontend URL.
+2. Link institution from Home page.
+3. Manage aliases or remove accounts on Account Details page.
+4. Start sync from Sync page and watch logs.
+5. Adjust non-secret runtime options in Service Configuration page.
+
+## Security and Production Notes
+
+- Access tokens are stored plaintext in SQLite by design currently.
+- Run backend PVC on encrypted storage class for production.
+- Restrict ingress host/TLS to real domain and managed certs.
+- Consider network policies limiting frontend<->backend and egress to Plaid only.
+- Consider external secret manager integration for Plaid credentials.

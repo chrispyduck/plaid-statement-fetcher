@@ -25,4 +25,4 @@ USER appuser
 
 EXPOSE 8765
 
-CMD ["uv", "run", "statement-fetcher", "serve", "--env", "production", "--host", "0.0.0.0", "--port", "8765"]
+CMD ["uv", "run", "statement-fetcher", "serve", "--host", "0.0.0.0", "--port", "8765"]
