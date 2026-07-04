@@ -1,7 +1,7 @@
 /credentials.json
 /.env
 /.venv/
-/__pycache__/
+__pycache__
 /.pytest_cache/
 /.mypy_cache/
 /.ruff_cache/
@@ -14,6 +14,5 @@
 /frontend/.env.local
 /frontend/.env.development.local
 /frontend/.env.production.local
-/certs/*.pem
-/certs/*-key.pem
+/certs
 *.sqlite
