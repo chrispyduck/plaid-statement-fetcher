@@ -3,6 +3,16 @@ kind: Kustomization
 
 namespace: statement-fetcher
 
+generatorOptions:
+  disableNameSuffixHash: true
+
+secretGenerator:
+  - name: statement-fetcher-backend-secrets
+    literals:
+      - PLAID_CLIENT_ID=replace-me
+      - PLAID_SECRET=replace-me
+      - PSF_ENCRYPTION_SECRET=replace-me-with-a-long-random-secret
+
 # Consume the stack from GitHub over HTTPS.
 # Replace ref=main with a release tag (for example: ref=v0.1.0) in production.
 resources:

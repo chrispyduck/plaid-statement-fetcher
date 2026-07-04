@@ -167,6 +167,12 @@ kubectl apply -k k8s/examples/http-reference
 This example uses an HTTPS GitHub reference to consume the stack and is defined in:
 - `k8s/examples/http-reference/kustomization.yaml`
 
+The example also generates `statement-fetcher-backend-secrets` via `secretGenerator`.
+Replace placeholder values for:
+- `PLAID_CLIENT_ID`
+- `PLAID_SECRET`
+- `PSF_ENCRYPTION_SECRET`
+
 ### 4. Verify
 
 ```bash
