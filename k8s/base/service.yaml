@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: statement-fetcher
+spec:
+  selector:
+    app: statement-fetcher
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 8765

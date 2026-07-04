@@ -1,1 +1,14 @@
 /credentials.json
+/.venv/
+/__pycache__/
+/.pytest_cache/
+/.mypy_cache/
+/.ruff_cache/
+/dist/
+/build/
+/config/sandbox/configuration.json
+/config/sandbox/state.json
+/config/production/configuration.json
+/config/production/state.json
+/config/sandbox/output/
+/config/production/output/
