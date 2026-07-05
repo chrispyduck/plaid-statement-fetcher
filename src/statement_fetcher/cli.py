@@ -26,14 +26,14 @@ SSL_CERTFILE_OPTION = typer.Option(None, "--ssl-certfile")
 SSL_KEYFILE_OPTION = typer.Option(None, "--ssl-keyfile")
 
 
-def resolve_settings(env: str) -> Settings:
-    settings = Settings(plaid_env=env)
+def resolve_settings(env: str | None) -> Settings:
+    settings = Settings(**({"plaid_env": env} if env else {}))
     settings.load_credentials_fallback(Path("credentials.json"))
     return settings
 
 
 @app.command()
-def init(env: str = typer.Option("sandbox", "--env")) -> None:
+def init(env: str | None = typer.Option(None, "--env")) -> None:
     settings = resolve_settings(env)
     ensure_environment_files(settings)
     print(f"[green]Initialized[/green] environment files at {settings.env_root}")
@@ -41,7 +41,7 @@ def init(env: str = typer.Option("sandbox", "--env")) -> None:
 
 @app.command("serve")
 def serve(
-    env: str = typer.Option("sandbox", "--env"),
+    env: str | None = typer.Option(None, "--env"),
     host: str = typer.Option("127.0.0.1", "--host"),
     port: int = typer.Option(8765, "--port"),
     ssl_certfile: Path | None = SSL_CERTFILE_OPTION,
@@ -64,7 +64,7 @@ def serve(
 
 @link_app.command("start")
 def link_start(
-    env: str = typer.Option("sandbox", "--env"),
+    env: str | None = typer.Option(None, "--env"),
     host: str = typer.Option("127.0.0.1", "--host"),
     port: int = typer.Option(8765, "--port"),
     no_browser: bool = typer.Option(False, "--no-browser"),
@@ -87,7 +87,7 @@ def link_start(
 
 
 @link_app.command("list")
-def link_list(env: str = typer.Option("sandbox", "--env")) -> None:
+def link_list(env: str | None = typer.Option(None, "--env")) -> None:
     settings = resolve_settings(env)
     config = load_configuration(settings)
     if not config.linked_items:
@@ -103,7 +103,7 @@ def link_list(env: str = typer.Option("sandbox", "--env")) -> None:
 
 @link_app.command("remove")
 def link_remove(
-    env: str = typer.Option("sandbox", "--env"),
+    env: str | None = typer.Option(None, "--env"),
     account_id: str | None = typer.Option(None, "--account-id"),
     institution_id: str | None = typer.Option(None, "--institution-id"),
 ) -> None:
@@ -127,13 +127,13 @@ def link_remove(
 
 
 @app.command()
-def status(env: str = typer.Option("sandbox", "--env")) -> None:
+def status(env: str | None = typer.Option(None, "--env")) -> None:
     settings = resolve_settings(env)
     config = load_configuration(settings)
     state = load_state(settings)
 
     accounts_count = sum(len(item.accounts) for item in config.linked_items)
-    print(f"[bold]Environment:[/bold] {env}")
+    print(f"[bold]Environment:[/bold] {settings.plaid_env}")
     print(f"[bold]Linked institutions:[/bold] {len(config.linked_items)}")
     print(f"[bold]Linked accounts:[/bold] {accounts_count}")
     print(f"[bold]Downloaded statements:[/bold] {len(state.downloaded_statements)}")
@@ -141,7 +141,7 @@ def status(env: str = typer.Option("sandbox", "--env")) -> None:
 
 @app.command()
 def fetch(
-    env: str = typer.Option("sandbox", "--env"),
+    env: str | None = typer.Option(None, "--env"),
     dry_run: bool = typer.Option(False, "--dry-run"),
     since: str | None = typer.Option(None, "--since"),
     account_id: str | None = typer.Option(None, "--account-id"),

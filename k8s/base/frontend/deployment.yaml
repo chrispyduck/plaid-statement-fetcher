@@ -9,7 +9,7 @@ spec:
       containers:
         - name: frontend
           image: ghcr.io/chrispyduck/plaid-statement-fetcher-frontend:main
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           ports:
             - containerPort: 8080
               name: http
