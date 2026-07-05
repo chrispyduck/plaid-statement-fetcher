@@ -8,7 +8,7 @@ spec:
     spec:
       containers:
         - name: frontend
-          image: ghcr.io/example/statement-fetcher-frontend:latest
+          image: ghcr.io/chrispyduck/plaid-statement-fetcher-frontend:main
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080

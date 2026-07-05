@@ -20,12 +20,10 @@ resources:
 
 # Override image tags/digests for your deployment target.
 images:
-  - name: ghcr.io/example/statement-fetcher-backend
-    newName: ghcr.io/chrispyduck/statement-fetcher-backend
-    newTag: latest
-  - name: ghcr.io/example/statement-fetcher-frontend
-    newName: ghcr.io/chrispyduck/statement-fetcher-frontend
-    newTag: latest
+  - name: ghcr.io/chrispyduck/plaid-statement-fetcher-backend
+    newTag: main
+  - name: ghcr.io/chrispyduck/plaid-statement-fetcher-frontend
+    newTag: main
 
 patches:
   # Example ingress host/TLS customization.
