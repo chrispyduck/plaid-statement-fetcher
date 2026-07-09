@@ -511,6 +511,100 @@ def get_account_details(settings: Settings, account_id: str) -> dict[str, Any] |
     }
 
 
+def list_downloaded_statements(
+    settings: Settings,
+    *,
+    account_id: str | None = None,
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    ensure_environment_files(settings)
+
+    where_clause = ""
+    args: list[Any] = []
+    if account_id:
+        where_clause = "WHERE ds.account_id = ?"
+        args.append(account_id)
+
+    with _connect(settings) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT
+                ds.dedupe_key,
+                ds.statement_id,
+                ds.institution_name,
+                ds.account_id,
+                ds.account_name,
+                ds.statement_date,
+                ds.file_path,
+                ds.downloaded_at,
+                la.alias
+            FROM downloaded_statements ds
+            LEFT JOIN linked_accounts la ON la.account_id = ds.account_id
+            {where_clause}
+            ORDER BY ds.statement_date DESC, ds.downloaded_at DESC
+            LIMIT ?
+            """,
+            (*args, limit),
+        ).fetchall()
+
+    statements: list[dict[str, Any]] = []
+    for row in rows:
+        file_path = Path(row["file_path"])
+        statements.append(
+            {
+                "dedupe_key": row["dedupe_key"],
+                "statement_id": row["statement_id"],
+                "institution_name": row["institution_name"],
+                "account_id": row["account_id"],
+                "account_name": row["alias"] or row["account_name"],
+                "statement_date": row["statement_date"],
+                "file_name": file_path.name,
+                "file_path": row["file_path"],
+                "downloaded_at": row["downloaded_at"],
+                "file_exists": file_path.exists(),
+            }
+        )
+    return statements
+
+
+def get_downloaded_statement_by_key(settings: Settings, dedupe_key: str) -> dict[str, Any] | None:
+    ensure_environment_files(settings)
+    with _connect(settings) as conn:
+        row = conn.execute(
+            """
+            SELECT
+                dedupe_key,
+                statement_id,
+                institution_name,
+                account_id,
+                account_name,
+                statement_date,
+                file_path,
+                downloaded_at
+            FROM downloaded_statements
+            WHERE dedupe_key = ?
+            """,
+            (dedupe_key,),
+        ).fetchone()
+
+    if row is None:
+        return None
+
+    file_path = Path(row["file_path"])
+    return {
+        "dedupe_key": row["dedupe_key"],
+        "statement_id": row["statement_id"],
+        "institution_name": row["institution_name"],
+        "account_id": row["account_id"],
+        "account_name": row["account_name"],
+        "statement_date": row["statement_date"],
+        "file_name": file_path.name,
+        "file_path": row["file_path"],
+        "downloaded_at": row["downloaded_at"],
+        "file_exists": file_path.exists(),
+    }
+
+
 def add_event(
     settings: Settings,
     *,

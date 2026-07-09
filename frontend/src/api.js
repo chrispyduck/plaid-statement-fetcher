@@ -55,3 +55,7 @@ export async function fetchJson(path, options = {}) {
   }
   return response.json();
 }
+
+export function statementDownloadUrl(dedupeKey) {
+  return `${apiBaseUrl()}/api/statements/${encodeURIComponent(String(dedupeKey || ''))}/download`;
+}

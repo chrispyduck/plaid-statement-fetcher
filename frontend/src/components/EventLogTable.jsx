@@ -16,6 +16,15 @@ import { Link as RouterLink } from 'react-router-dom';
 import ErrorOutlineIcon from '@mui/icons-material/ErrorOutline';
 import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined';
 import WarningAmberIcon from '@mui/icons-material/WarningAmber';
+import { apiBaseUrl } from '../api';
+
+function statementDownloadUrl(entry) {
+  const dedupeKey = entry?.metadata?.dedupe_key;
+  if (!dedupeKey) {
+    return '';
+  }
+  return `${apiBaseUrl()}/api/statements/${encodeURIComponent(dedupeKey)}/download`;
+}
 
 function sanitizeMessage(message, accountLookup) {
   let text = String(message || '');
@@ -53,6 +62,7 @@ function renderInlineMessage(entry, accountLookup) {
     entry,
     accountLookup,
   );
+  const downloadUrl = statementDownloadUrl(entry);
 
   if (entry?.event_type === 'statement_existing' && statementDate) {
     return (
@@ -66,6 +76,35 @@ function renderInlineMessage(entry, accountLookup) {
             </Link>
           </>
         )}
+        {downloadUrl && (
+          <>
+            {' · '}
+            <Link href={downloadUrl} underline="hover">
+              Download
+            </Link>
+          </>
+        )}
+      </>
+    );
+  }
+
+  if (entry?.event_type === 'statement_downloaded' && downloadUrl) {
+    return (
+      <>
+        {baseMessage}
+        {accountId && (
+          <>
+            {' for '}
+            <Link component={RouterLink} to={`/accounts/${accountId}`} underline="hover">
+              {accountName}
+            </Link>
+          </>
+        )}
+        {statementDate ? ` on ${statementDate}` : ''}
+        {' · '}
+        <Link href={downloadUrl} underline="hover">
+          Download
+        </Link>
       </>
     );
   }

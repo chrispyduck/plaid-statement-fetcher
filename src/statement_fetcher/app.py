@@ -25,8 +25,10 @@ from .storage import (
     ensure_environment_files,
     fail_sync_job,
     get_account_details,
+    get_downloaded_statement_by_key,
     get_service_configuration,
     get_sync_job,
+    list_downloaded_statements,
     list_events,
     load_configuration,
     remove_account_from_configuration,
@@ -78,7 +80,7 @@ class SyncJobState(BaseModel):
     skipped_existing: int = 0
     skipped_filtered: int = 0
     errors: int = 0
-    logs: list[dict[str, object]] = Field(default_factory=list)
+    logs: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ServiceConfigUpdateRequest(BaseModel):
@@ -606,6 +608,30 @@ def create_app(
         job_id: str | None = None,
     ) -> list[dict[str, Any]]:
         return list_events(ctx.settings, account_id=account_id, job_id=job_id, limit=300)
+
+    @app.get("/api/statements")
+    def list_statements(account_id: str | None = None) -> list[dict[str, Any]]:
+        return list_downloaded_statements(ctx.settings, account_id=account_id, limit=1000)
+
+    @app.get("/api/statements/{dedupe_key}/download")
+    def download_statement(dedupe_key: str) -> FileResponse:
+        statement = get_downloaded_statement_by_key(ctx.settings, dedupe_key)
+        if statement is None:
+            raise HTTPException(status_code=404, detail="statement not found")
+
+        raw_path = Path(str(statement["file_path"]))
+        file_path = raw_path.expanduser().resolve()
+        output_root = ctx.settings.output_dir.expanduser().resolve()
+        if output_root not in file_path.parents:
+            raise HTTPException(status_code=400, detail="invalid statement path")
+        if not file_path.exists() or not file_path.is_file():
+            raise HTTPException(status_code=404, detail="statement file missing")
+
+        return FileResponse(
+            file_path,
+            media_type="application/pdf",
+            filename=str(statement["file_name"]),
+        )
 
     @app.get("/plaid/callback")
     def plaid_callback() -> dict[str, str]:

@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Alert, Button, Card, CardContent, CircularProgress, LinearProgress, Snackbar, Stack, Table, TableBody, TableCell, TableHead, TableRow, Typography } from '@mui/material';
 import SyncIcon from '@mui/icons-material/Sync';
-import { fetchJson } from '../api';
+import { fetchJson, statementDownloadUrl } from '../api';
 import EventLogTable from '../components/EventLogTable';
 
 function SyncProgressPage() {
   const [jobs, setJobs] = useState([]);
+  const [downloadedStatements, setDownloadedStatements] = useState([]);
   const [accountLookup, setAccountLookup] = useState({});
   const [isStartingSync, setIsStartingSync] = useState(false);
   const [toastMessage, setToastMessage] = useState('');
@@ -71,9 +72,20 @@ function SyncProgressPage() {
     }
   };
 
+  const loadDownloadedStatements = async () => {
+    try {
+      const rows = await fetchJson('/api/statements');
+      setDownloadedStatements(rows || []);
+    } catch (error) {
+      console.error('Failed loading downloaded statements', error);
+      setErrorMessage(`Failed to load downloaded statements: ${String(error)}`);
+    }
+  };
+
   useEffect(() => {
     loadJobs();
     loadAccounts();
+    loadDownloadedStatements();
   }, []);
 
   useEffect(() => {
@@ -113,6 +125,7 @@ function SyncProgressPage() {
       }
       showToast('Sync started.');
       await loadJobs({ preferredJobId: nextJobId });
+      await loadDownloadedStatements();
     } catch (error) {
       console.error('Sync start failed', error);
       setErrorMessage(`Failed to start sync: ${String(error)}`);
@@ -120,6 +133,12 @@ function SyncProgressPage() {
       setIsStartingSync(false);
     }
   };
+
+  useEffect(() => {
+    if (selectedJob?.status === 'completed' || selectedJob?.status === 'failed') {
+      loadDownloadedStatements();
+    }
+  }, [selectedJob?.job_id, selectedJob?.status]);
 
   return (
     <Stack spacing={2}>
@@ -208,6 +227,57 @@ function SyncProgressPage() {
               emptyText="No logs yet."
               accountLookup={accountLookup}
             />
+          </Stack>
+        </CardContent>
+      </Card>
+
+      <Card variant="outlined" sx={{ borderRadius: 3 }}>
+        <CardContent>
+          <Stack spacing={2}>
+            <Typography variant="h6">Previously Fetched Statements</Typography>
+            <Table size="small">
+              <TableHead>
+                <TableRow>
+                  <TableCell>Date</TableCell>
+                  <TableCell>Account</TableCell>
+                  <TableCell>Institution</TableCell>
+                  <TableCell>File</TableCell>
+                  <TableCell>Downloaded</TableCell>
+                  <TableCell>Action</TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {downloadedStatements.length === 0 ? (
+                  <TableRow>
+                    <TableCell colSpan={6}>No downloaded statements yet.</TableCell>
+                  </TableRow>
+                ) : (
+                  downloadedStatements.map((statement) => (
+                    <TableRow key={statement.dedupe_key}>
+                      <TableCell>{statement.statement_date}</TableCell>
+                      <TableCell>{statement.account_name || 'Account'}</TableCell>
+                      <TableCell>{statement.institution_name || 'Institution'}</TableCell>
+                      <TableCell>{statement.file_name || 'statement.pdf'}</TableCell>
+                      <TableCell>
+                        {statement.downloaded_at
+                          ? new Date(statement.downloaded_at).toLocaleString()
+                          : '—'}
+                      </TableCell>
+                      <TableCell>
+                        <Button
+                          size="small"
+                          variant="outlined"
+                          href={statementDownloadUrl(statement.dedupe_key)}
+                          disabled={!statement.file_exists}
+                        >
+                          Download
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                  ))
+                )}
+              </TableBody>
+            </Table>
           </Stack>
         </CardContent>
       </Card>

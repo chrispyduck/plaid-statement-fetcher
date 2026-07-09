@@ -170,6 +170,29 @@ def sync_statements(
 
         institution_name = response.get("institution_name") or linked_item.institution_name
         accounts = response.get("accounts") or []
+        response_account_ids = {
+            str(response_account.get("account_id"))
+            for response_account in accounts
+            if response_account.get("account_id")
+        }
+
+        for configured_account in linked_item.accounts:
+            configured_account_id = configured_account.account_id
+            if account_id and configured_account_id != account_id:
+                continue
+            if configured_account_id in response_account_ids:
+                continue
+            if event_callback:
+                event_callback(
+                    "account_statement_unavailable",
+                    "Account has no statements available or does not support statements",
+                    {
+                        "account_id": configured_account_id,
+                        "account_name": configured_account.alias or configured_account.account_name,
+                        "institution_name": institution_name,
+                        "reason": "not_returned_by_plaid_statements_list",
+                    },
+                )
 
         for response_account in accounts:
             response_account_id = response_account.get("account_id")
@@ -216,6 +239,16 @@ def sync_statements(
                         "total_statements": listed_for_account,
                         "new_statements": new_for_account,
                         "existing_statements": existing_for_account,
+                    },
+                )
+            elif event_callback:
+                event_callback(
+                    "account_no_statements",
+                    "No statements available for account",
+                    {
+                        "account_id": response_account_id,
+                        "account_name": chosen_name,
+                        "institution_name": institution_name,
                     },
                 )
 
@@ -280,6 +313,8 @@ def sync_statements(
                         }
                         if existing_entry and existing_entry.file_path:
                             existing_metadata["file_name"] = Path(existing_entry.file_path).name
+                            existing_metadata["file_path"] = existing_entry.file_path
+                        existing_metadata["dedupe_key"] = dedupe_key
                         event_callback(
                             "statement_existing",
                             "Statement already downloaded",
@@ -400,6 +435,7 @@ def sync_statements(
                             "statement_date": statement_date.isoformat(),
                             "file_name": output_path.name,
                             "file_path": str(output_path),
+                            "dedupe_key": dedupe_key,
                         },
                     )
                 logger.info(

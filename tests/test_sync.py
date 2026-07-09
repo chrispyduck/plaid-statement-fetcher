@@ -88,3 +88,57 @@ def test_sync_since_filter(tmp_path) -> None:
     assert result.downloaded == 0
     assert result.skipped_filtered == 1
     assert client.download_calls == 0
+
+
+class FakeSyncPlaidClientWithSparseAccounts:
+    def list_statements(self, access_token: str) -> dict:
+        assert access_token == "access_1"
+        return {
+            "institution_name": "Chase",
+            "accounts": [
+                {
+                    "account_id": "acc_1",
+                    "account_name": "Everyday Checking",
+                    "statements": [],
+                }
+            ],
+        }
+
+    def download_statement(self, access_token: str, statement_id: str) -> tuple[bytes, str | None]:
+        raise AssertionError("No statement downloads expected")
+
+
+def test_sync_logs_no_statement_and_unavailable_accounts(tmp_path) -> None:
+    settings = Settings(plaid_env="sandbox", PSF_CONFIG_ROOT=tmp_path)
+
+    linked_item = LinkedItem(
+        institution_id="ins_1",
+        institution_name="Chase",
+        item_id="item_1",
+        access_token="access_1",
+        accounts=[
+            LinkedAccount(account_id="acc_1", account_name="Checking"),
+            LinkedAccount(account_id="acc_2", account_name="Savings"),
+        ],
+    )
+    upsert_linked_item(settings, linked_item)
+
+    client = FakeSyncPlaidClientWithSparseAccounts()
+    captured_events: list[tuple[str, str, dict[str, str | int] | None]] = []
+
+    summary = sync_statements(
+        settings,
+        plaid_client=client,
+        event_callback=lambda event_type, message, metadata: captured_events.append(
+            (event_type, message, metadata)
+        ),
+    )
+
+    assert summary.downloaded == 0
+    event_types = [event_type for event_type, _message, _metadata in captured_events]
+    assert "account_no_statements" in event_types
+    assert "account_statement_unavailable" in event_types
+
+    unavailable = [entry for entry in captured_events if entry[0] == "account_statement_unavailable"]
+    assert unavailable[0][2] is not None
+    assert unavailable[0][2]["account_id"] == "acc_2"

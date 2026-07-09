@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from datetime import date
 
 import httpx
 
 from statement_fetcher.app import create_app
+from statement_fetcher.models import DownloadedStatement, StateFile
 from statement_fetcher.settings import Settings
-from statement_fetcher.storage import add_event, complete_sync_job, create_sync_job
+from statement_fetcher.storage import add_event, complete_sync_job, create_sync_job, save_state
 
 
 class FakePlaidClient:
@@ -221,5 +223,81 @@ def test_sync_history_reads_persisted_jobs(tmp_path) -> None:
         payload = status_response.json()
         assert payload["status"] == "completed"
         assert len(payload["logs"]) == 1
+
+    run_with_client(app, test_body)
+
+
+def test_downloaded_statements_endpoints(tmp_path) -> None:
+    settings = Settings(plaid_env="sandbox", PSF_CONFIG_ROOT=tmp_path)
+    output_file = tmp_path / "output" / "2026-06-30, Chase, Checking, stmt_1.pdf"
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    output_file.write_bytes(b"%PDF-1.7 fake")
+
+    save_state(
+        settings,
+        StateFile(
+            environment="sandbox",
+            downloaded_statements=[
+                DownloadedStatement(
+                    statement_id="stmt_1",
+                    institution_name="Chase",
+                    account_id="acc_1",
+                    account_name="Checking",
+                    statement_date=date(2026, 6, 30),
+                    file_path=str(output_file),
+                    dedupe_key="Chase|acc_1|stmt_1",
+                )
+            ],
+        ),
+    )
+
+    app = create_app(settings=settings, plaid_client=FakePlaidClient())
+
+    async def test_body(client: httpx.AsyncClient) -> None:
+        list_response = await client.get("/api/statements")
+        assert list_response.status_code == 200
+        statements = list_response.json()
+        assert len(statements) == 1
+        assert statements[0]["dedupe_key"] == "Chase|acc_1|stmt_1"
+        assert statements[0]["file_exists"] is True
+
+        download_response = await client.get("/api/statements/Chase%7Cacc_1%7Cstmt_1/download")
+        assert download_response.status_code == 200
+        assert download_response.content.startswith(b"%PDF-1.7")
+
+        missing_response = await client.get("/api/statements/missing/download")
+        assert missing_response.status_code == 404
+
+    run_with_client(app, test_body)
+
+
+def test_download_statement_rejects_path_outside_output_dir(tmp_path) -> None:
+    settings = Settings(plaid_env="sandbox", PSF_CONFIG_ROOT=tmp_path)
+    outside_file = tmp_path / "outside.pdf"
+    outside_file.write_bytes(b"%PDF-1.7 fake")
+
+    save_state(
+        settings,
+        StateFile(
+            environment="sandbox",
+            downloaded_statements=[
+                DownloadedStatement(
+                    statement_id="stmt_1",
+                    institution_name="Chase",
+                    account_id="acc_1",
+                    account_name="Checking",
+                    statement_date=date(2026, 6, 30),
+                    file_path=str(outside_file),
+                    dedupe_key="Chase|acc_1|outside",
+                )
+            ],
+        ),
+    )
+
+    app = create_app(settings=settings, plaid_client=FakePlaidClient())
+
+    async def test_body(client: httpx.AsyncClient) -> None:
+        response = await client.get("/api/statements/Chase%7Cacc_1%7Coutside/download")
+        assert response.status_code == 400
 
     run_with_client(app, test_body)
