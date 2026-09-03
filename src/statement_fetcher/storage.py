@@ -109,9 +109,6 @@ def _initialize_database(path: Path) -> None:
             CREATE INDEX IF NOT EXISTS idx_sync_jobs_started_at
             ON sync_jobs(started_at);
 
-            CREATE INDEX IF NOT EXISTS idx_sync_jobs_job_type
-            ON sync_jobs(job_type);
-
             CREATE TABLE IF NOT EXISTS service_config (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
@@ -132,6 +129,11 @@ def _initialize_database(path: Path) -> None:
             conn.execute("ALTER TABLE sync_jobs ADD COLUMN requested INTEGER")
         if "failed" not in sync_job_columns:
             conn.execute("ALTER TABLE sync_jobs ADD COLUMN failed INTEGER")
+
+        # job_type is only guaranteed to exist once the migration above has run, so
+        # this index has to be created after that rather than alongside the table's
+        # initial CREATE TABLE (which is a no-op on a pre-existing database).
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sync_jobs_job_type ON sync_jobs(job_type)")
         conn.commit()
     finally:
         conn.close()

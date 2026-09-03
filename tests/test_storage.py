@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sqlite3
+
 from statement_fetcher.models import LinkedAccount, LinkedItem
 from statement_fetcher.settings import Settings
 from statement_fetcher.storage import (
@@ -39,8 +41,6 @@ def test_access_token_encrypted_at_rest_when_secret_is_set(tmp_path) -> None:
 
     config = load_configuration(settings)
     assert config.linked_items[0].access_token == "access-plain"
-
-    import sqlite3
 
     conn = sqlite3.connect(tmp_path / "state.db")
     try:
@@ -127,6 +127,47 @@ def test_single_mode_storage_paths(tmp_path) -> None:
     assert (tmp_path / "output").exists()
     assert not (tmp_path / "sandbox").exists()
     assert not (tmp_path / "production").exists()
+
+
+def test_migrates_pre_job_type_sync_jobs_table(tmp_path) -> None:
+    # Regression test: a database created before job_type/requested/failed existed
+    # must upgrade cleanly, including the job_type index (which previously lived in
+    # the same executescript as the no-op CREATE TABLE IF NOT EXISTS, so it ran
+    # before the column that backs it was added by the migration below it).
+    settings = Settings(plaid_env="sandbox", PSF_CONFIG_ROOT=tmp_path)
+    db_path = tmp_path / "state.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE sync_jobs (
+                job_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                error TEXT,
+                listed INTEGER NOT NULL DEFAULT 0,
+                downloaded INTEGER NOT NULL DEFAULT 0,
+                skipped_existing INTEGER NOT NULL DEFAULT 0,
+                skipped_filtered INTEGER NOT NULL DEFAULT 0,
+                errors INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    ensure_environment_files(settings)  # must not raise
+
+    create_sync_job(
+        settings, "job-after-migration", "2026-01-01T00:00:00+00:00", job_type="refresh"
+    )
+    job = get_sync_job(settings, "job-after-migration")
+    assert job is not None
+    assert job["job_type"] == "refresh"
 
 
 def test_sync_job_persistence_lifecycle(tmp_path) -> None:
