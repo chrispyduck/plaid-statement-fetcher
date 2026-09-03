@@ -50,7 +50,7 @@ def serve(
     import uvicorn
 
     settings = resolve_settings(env)
-    application = create_app(settings)
+    application = create_app(settings, enable_scheduler=True)
     uvicorn.run(
         application,
         host=host,

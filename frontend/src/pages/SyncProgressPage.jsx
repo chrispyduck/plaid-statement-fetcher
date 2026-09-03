@@ -1,25 +1,64 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Alert, Button, Card, CardContent, CircularProgress, LinearProgress, Snackbar, Stack, Table, TableBody, TableCell, TableHead, TableRow, Typography } from '@mui/material';
+import { Alert, Button, Card, CardContent, CircularProgress, Grid, LinearProgress, Snackbar, Stack, Table, TableBody, TableCell, TableHead, TableRow, Typography } from '@mui/material';
 import SyncIcon from '@mui/icons-material/Sync';
+import RefreshIcon from '@mui/icons-material/Refresh';
 import { fetchJson, statementDownloadUrl } from '../api';
 import EventLogTable from '../components/EventLogTable';
 
+function formatTimestamp(value) {
+  return value ? new Date(value).toLocaleString() : 'Never';
+}
+
+function JobSummaryCard({ title, job, icon }) {
+  return (
+    <Card variant="outlined" sx={{ p: 2, height: '100%' }}>
+      <Stack spacing={0.5}>
+        <Stack direction="row" spacing={1} alignItems="center">
+          {icon}
+          <Typography variant="subtitle2">{title}</Typography>
+        </Stack>
+        {!job ? (
+          <Typography variant="body2" color="text.secondary">
+            Never run yet.
+          </Typography>
+        ) : (
+          <>
+            <Typography variant="body2">
+              Last started: {formatTimestamp(job.started_at)}
+            </Typography>
+            <Typography variant="body2">
+              Status: {job.status}
+              {job.status === 'completed' && ` (finished ${formatTimestamp(job.finished_at)})`}
+            </Typography>
+          </>
+        )}
+      </Stack>
+    </Card>
+  );
+}
+
 function SyncProgressPage() {
   const [jobs, setJobs] = useState([]);
+  const [jobsSummary, setJobsSummary] = useState({ refresh: null, sync: null });
   const [downloadedStatements, setDownloadedStatements] = useState([]);
   const [accountLookup, setAccountLookup] = useState({});
   const [isStartingSync, setIsStartingSync] = useState(false);
+  const [isStartingRefresh, setIsStartingRefresh] = useState(false);
   const [toastMessage, setToastMessage] = useState('');
   const [isToastOpen, setIsToastOpen] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
   const [selectedJobId, setSelectedJobId] = useState(null);
   const [selectedJob, setSelectedJob] = useState(null);
 
-  const activeJob = useMemo(() => jobs[0] || null, [jobs]);
-  const hasRunningJob = useMemo(
-    () => jobs.some((job) => job.status === 'running'),
+  const hasRunningSyncJob = useMemo(
+    () => jobs.some((job) => job.job_type !== 'refresh' && job.status === 'running'),
     [jobs],
   );
+  const hasRunningRefreshJob = useMemo(
+    () => jobs.some((job) => job.job_type === 'refresh' && job.status === 'running'),
+    [jobs],
+  );
+  const hasRunningJob = hasRunningSyncJob || hasRunningRefreshJob;
 
   const showToast = (message) => {
     setToastMessage(message);
@@ -54,6 +93,15 @@ function SyncProgressPage() {
     }
   };
 
+  const loadJobsSummary = async () => {
+    try {
+      const payload = await fetchJson('/api/jobs/summary');
+      setJobsSummary({ refresh: payload?.refresh || null, sync: payload?.sync || null });
+    } catch (error) {
+      console.error('Failed loading job summary', error);
+    }
+  };
+
   const loadAccounts = async () => {
     try {
       const rows = await fetchJson('/api/accounts');
@@ -84,19 +132,21 @@ function SyncProgressPage() {
 
   useEffect(() => {
     loadJobs();
+    loadJobsSummary();
     loadAccounts();
     loadDownloadedStatements();
   }, []);
 
   useEffect(() => {
-    if (!hasRunningJob && !isStartingSync) {
+    if (!hasRunningJob && !isStartingSync && !isStartingRefresh) {
       return undefined;
     }
     const timer = window.setInterval(() => {
       loadJobs();
+      loadJobsSummary();
     }, 1200);
     return () => window.clearInterval(timer);
-  }, [hasRunningJob, isStartingSync, selectedJobId]);
+  }, [hasRunningJob, isStartingSync, isStartingRefresh, selectedJobId]);
 
   const openJob = async (jobId) => {
     try {
@@ -123,14 +173,36 @@ function SyncProgressPage() {
       if (nextJobId) {
         setSelectedJobId(nextJobId);
       }
-      showToast('Sync started.');
+      showToast('Fetch started.');
       await loadJobs({ preferredJobId: nextJobId });
+      await loadJobsSummary();
       await loadDownloadedStatements();
     } catch (error) {
       console.error('Sync start failed', error);
-      setErrorMessage(`Failed to start sync: ${String(error)}`);
+      setErrorMessage(`Failed to start fetch: ${String(error)}`);
     } finally {
       setIsStartingSync(false);
+    }
+  };
+
+  const startRefresh = async () => {
+    setIsStartingRefresh(true);
+    setErrorMessage('');
+    setSelectedJob(null);
+    try {
+      const payload = await fetchJson('/api/refresh/start', { method: 'POST' });
+      const nextJobId = payload?.job_id || null;
+      if (nextJobId) {
+        setSelectedJobId(nextJobId);
+      }
+      showToast('Refresh started. Newly-posted statements usually take a while to show up in Plaid — run a fetch after it completes.');
+      await loadJobs({ preferredJobId: nextJobId });
+      await loadJobsSummary();
+    } catch (error) {
+      console.error('Refresh start failed', error);
+      setErrorMessage(`Failed to start refresh: ${String(error)}`);
+    } finally {
+      setIsStartingRefresh(false);
     }
   };
 
@@ -146,32 +218,74 @@ function SyncProgressPage() {
         <CardContent>
           <Stack spacing={2}>
             <Typography variant="h5">Statement Download Progress</Typography>
+            <Typography variant="body2" color="text.secondary">
+              Refresh asks Plaid to check your institutions for newly-posted statements; fetch
+              lists and downloads whatever Plaid currently has. They run on independent
+              schedules — by default, refresh weekly and fetch ~24h after each refresh
+              completes — since Plaid needs time to process a refresh before new
+              statements show up.
+            </Typography>
+            <Grid container spacing={2}>
+              <Grid item xs={12} sm={6}>
+                <JobSummaryCard
+                  title="Last Refresh"
+                  job={jobsSummary.refresh}
+                  icon={<RefreshIcon fontSize="small" />}
+                />
+              </Grid>
+              <Grid item xs={12} sm={6}>
+                <JobSummaryCard
+                  title="Last Fetch"
+                  job={jobsSummary.sync}
+                  icon={<SyncIcon fontSize="small" />}
+                />
+              </Grid>
+            </Grid>
             <Stack direction="row" spacing={2} alignItems="center" flexWrap="wrap">
+              <Button
+                variant="outlined"
+                startIcon={
+                  isStartingRefresh ? <CircularProgress size={18} color="inherit" /> : <RefreshIcon />
+                }
+                disabled={isStartingRefresh || hasRunningRefreshJob}
+                onClick={startRefresh}
+              >
+                {hasRunningRefreshJob ? 'Refreshing...' : 'Run Refresh Now'}
+              </Button>
               <Button
                 variant="contained"
                 startIcon={isStartingSync ? <CircularProgress size={18} color="inherit" /> : <SyncIcon />}
-                disabled={isStartingSync || hasRunningJob}
+                disabled={isStartingSync || hasRunningSyncJob}
                 onClick={startSync}
               >
-                {hasRunningJob ? 'Syncing...' : 'Start Sync'}
+                {hasRunningSyncJob ? 'Fetching...' : 'Run Fetch Now'}
               </Button>
             </Stack>
 
             {!!errorMessage && <Alert severity="error">{errorMessage}</Alert>}
 
             {!selectedJob ? (
-              <Typography color="text.secondary">No sync jobs yet.</Typography>
+              <Typography color="text.secondary">No jobs yet.</Typography>
             ) : (
               <Card variant="outlined" sx={{ p: 2 }}>
                 <Stack spacing={1}>
-                  <Typography variant="subtitle2">Selected Job: {selectedJob.job_id}</Typography>
+                  <Typography variant="subtitle2">
+                    Selected {selectedJob.job_type === 'refresh' ? 'Refresh' : 'Fetch'} Job:{' '}
+                    {selectedJob.job_id}
+                  </Typography>
                   {selectedJob.status === 'running' && <LinearProgress />}
                   <Typography variant="body2">Status: {selectedJob.status}</Typography>
-                  <Typography variant="body2">
-                    Listed: {selectedJob.listed} | Downloaded: {selectedJob.downloaded} | Existing:{' '}
-                    {selectedJob.skipped_existing} | Filtered: {selectedJob.skipped_filtered} | Errors:{' '}
-                    {selectedJob.errors}
-                  </Typography>
+                  {selectedJob.job_type === 'refresh' ? (
+                    <Typography variant="body2">
+                      Requested: {selectedJob.requested ?? 0} | Failed: {selectedJob.failed ?? 0}
+                    </Typography>
+                  ) : (
+                    <Typography variant="body2">
+                      Listed: {selectedJob.listed} | Downloaded: {selectedJob.downloaded} | Existing:{' '}
+                      {selectedJob.skipped_existing} | Filtered: {selectedJob.skipped_filtered} | Errors:{' '}
+                      {selectedJob.errors}
+                    </Typography>
+                  )}
                   {!!selectedJob.error && <Alert severity="error">{selectedJob.error}</Alert>}
                 </Stack>
               </Card>
@@ -183,27 +297,33 @@ function SyncProgressPage() {
       <Card variant="outlined" sx={{ borderRadius: 3 }}>
         <CardContent>
           <Stack spacing={2}>
-            <Typography variant="h6">Sync History</Typography>
+            <Typography variant="h6">Job History</Typography>
             <Table size="small">
               <TableHead>
                 <TableRow>
                   <TableCell>Started</TableCell>
+                  <TableCell>Type</TableCell>
                   <TableCell>Status</TableCell>
-                  <TableCell>Downloads</TableCell>
+                  <TableCell>Result</TableCell>
                   <TableCell>Open</TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
                 {jobs.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={4}>No sync runs yet.</TableCell>
+                    <TableCell colSpan={5}>No jobs yet.</TableCell>
                   </TableRow>
                 ) : (
                   jobs.map((job) => (
                     <TableRow key={job.job_id} selected={job.job_id === selectedJobId}>
                       <TableCell>{new Date(job.started_at).toLocaleString()}</TableCell>
+                      <TableCell>{job.job_type === 'refresh' ? 'Refresh' : 'Fetch'}</TableCell>
                       <TableCell>{job.status}</TableCell>
-                      <TableCell>{job.downloaded}</TableCell>
+                      <TableCell>
+                        {job.job_type === 'refresh'
+                          ? `${job.requested ?? 0} requested`
+                          : `${job.downloaded} downloaded`}
+                      </TableCell>
                       <TableCell>
                         <Button size="small" variant="outlined" onClick={() => openJob(job.job_id)}>
                           Open Logs

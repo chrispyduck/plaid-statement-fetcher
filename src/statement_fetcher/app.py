@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from threading import Thread
 from typing import Any
@@ -19,6 +20,7 @@ from .plaid_api import PlaidAPIError, PlaidClient
 from .settings import Settings
 from .storage import (
     add_event,
+    complete_refresh_job,
     complete_sync_job,
     create_sync_job,
     delete_service_configuration_keys,
@@ -26,23 +28,30 @@ from .storage import (
     fail_sync_job,
     get_account_details,
     get_downloaded_statement_by_key,
+    get_latest_completed_job,
+    get_latest_job,
     get_service_configuration,
     get_sync_job,
+    has_running_job,
     list_downloaded_statements,
     list_events,
     load_configuration,
     remove_account_from_configuration,
     set_account_alias,
     set_service_configuration,
+    update_refresh_job_progress,
     update_sync_job_progress,
     upsert_linked_item,
 )
 from .storage import (
     list_sync_jobs as list_persisted_sync_jobs,
 )
-from .sync import SyncSummary, sync_statements
+from .sync import RefreshSummary, SyncSummary, refresh_statements, sync_statements
 
 logger = logging.getLogger(__name__)
+
+# How often the scheduler wakes up to check whether a refresh or fetch job is due.
+SCHEDULER_POLL_SECONDS = 300
 
 
 ServiceSettingValue = str | int | float | date | None
@@ -71,6 +80,7 @@ class SyncStartRequest(BaseModel):
 
 class SyncJobState(BaseModel):
     job_id: str
+    job_type: str = "sync"
     status: str
     started_at: str
     finished_at: str | None = None
@@ -80,6 +90,8 @@ class SyncJobState(BaseModel):
     skipped_existing: int = 0
     skipped_filtered: int = 0
     errors: int = 0
+    requested: int | None = None
+    failed: int | None = None
     logs: list[dict[str, Any]] = Field(default_factory=list)
 
 
@@ -185,9 +197,56 @@ def _map_plaid_accounts(accounts: list[dict[str, Any]]) -> list[LinkedAccount]:
     return mapped
 
 
+def scheduler_tick(
+    settings: Settings,
+    *,
+    launch_refresh: Callable[[], Any],
+    launch_sync: Callable[[], Any],
+) -> None:
+    """Run refresh weekly, and run fetch once ~24h after each refresh completes.
+
+    Refresh and fetch are deliberately on independent clocks: refresh just needs to
+    happen regularly so Plaid has time to pick up newly-posted statements, and fetch
+    should trail it by enough time for that to actually finish (Plaid gives no
+    completion signal short of a webhook), not run on its own weekly clock that could
+    race ahead of a refresh that's still in flight. `launch_refresh`/`launch_sync` are
+    injected so this can be tested without spawning real background jobs.
+    """
+    now = datetime.now(UTC)
+
+    if not has_running_job(settings, "refresh"):
+        last_refresh = get_latest_job(settings, "refresh")
+        refresh_due = last_refresh is None or (
+            now - datetime.fromisoformat(last_refresh["started_at"])
+            >= timedelta(hours=settings.refresh_interval_hours)
+        )
+        if refresh_due:
+            logger.info("Scheduler triggering statement refresh")
+            launch_refresh()
+
+    if not has_running_job(settings, "sync"):
+        last_refresh_completed = get_latest_completed_job(settings, "refresh")
+        if last_refresh_completed and last_refresh_completed["finished_at"]:
+            refresh_done_at = datetime.fromisoformat(last_refresh_completed["finished_at"])
+            last_sync = get_latest_job(settings, "sync")
+            already_ran_after_refresh = last_sync is not None and (
+                datetime.fromisoformat(last_sync["started_at"]) >= refresh_done_at
+            )
+            hours_since_refresh = now - refresh_done_at
+            fetch_due = (
+                not already_ran_after_refresh
+                and hours_since_refresh >= timedelta(hours=settings.fetch_after_refresh_hours)
+            )
+            if fetch_due:
+                logger.info("Scheduler triggering statement fetch")
+                launch_sync()
+
+
 def create_app(
     settings: Settings | None = None,
     plaid_client: PlaidClient | None = None,
+    *,
+    enable_scheduler: bool = False,
 ) -> FastAPI:
     if not logging.getLogger().handlers:
         logging.basicConfig(
@@ -467,17 +526,17 @@ def create_app(
             "accounts_count": len(linked_item.accounts),
         }
 
-    @app.post("/api/sync/start")
-    def start_sync(payload: SyncStartRequest) -> dict[str, str]:
+    def _launch_sync_job(payload: SyncStartRequest, *, trigger: str = "manual") -> str:
         job_id = str(uuid4())
         started_at = datetime.now(UTC).isoformat()
-        create_sync_job(ctx.settings, job_id, started_at)
+        create_sync_job(ctx.settings, job_id, started_at, job_type="sync")
         add_event(
             ctx.settings,
             event_type="sync_started",
             message="Sync job started",
             job_id=job_id,
             metadata={
+                "trigger": trigger,
                 "dry_run": payload.dry_run,
                 "since": payload.since,
                 "account_id": payload.account_id,
@@ -485,8 +544,10 @@ def create_app(
             },
         )
         logger.info(
-            "Sync job started job_id=%s dry_run=%s since=%s account_id=%s max_downloads=%s",
+            "Sync job started job_id=%s trigger=%s dry_run=%s since=%s account_id=%s "
+            "max_downloads=%s",
             job_id,
+            trigger,
             payload.dry_run,
             payload.since,
             payload.account_id,
@@ -494,8 +555,6 @@ def create_app(
         )
 
         def run_sync() -> None:
-            from datetime import date
-
             since_date = date.fromisoformat(payload.since) if payload.since else None
 
             def on_progress(summary: SyncSummary) -> None:
@@ -584,7 +643,91 @@ def create_app(
                 )
 
         Thread(target=run_sync, daemon=True).start()
-        return {"job_id": job_id}
+        return job_id
+
+    def _launch_refresh_job(*, trigger: str = "manual") -> str:
+        job_id = str(uuid4())
+        started_at = datetime.now(UTC).isoformat()
+        create_sync_job(ctx.settings, job_id, started_at, job_type="refresh")
+        add_event(
+            ctx.settings,
+            event_type="refresh_started",
+            message="Statement refresh job started",
+            job_id=job_id,
+            metadata={"trigger": trigger},
+        )
+        logger.info("Refresh job started job_id=%s trigger=%s", job_id, trigger)
+
+        def run_refresh() -> None:
+            def on_progress(summary: RefreshSummary) -> None:
+                update_refresh_job_progress(
+                    ctx.settings,
+                    job_id=job_id,
+                    requested=summary.requested,
+                    failed=summary.failed,
+                )
+
+            try:
+                summary = refresh_statements(
+                    ctx.settings,
+                    progress_callback=on_progress,
+                    event_callback=lambda event_type, message, metadata: add_event(
+                        ctx.settings,
+                        event_type=event_type,
+                        message=message,
+                        level="warning" if event_type == "statement_refresh_failed" else "info",
+                        job_id=job_id,
+                        metadata=metadata,
+                    ),
+                )
+                finished_at = datetime.now(UTC).isoformat()
+                complete_refresh_job(
+                    ctx.settings,
+                    job_id=job_id,
+                    finished_at=finished_at,
+                    requested=summary.requested,
+                    failed=summary.failed,
+                )
+                add_event(
+                    ctx.settings,
+                    event_type="refresh_completed",
+                    message="Statement refresh job completed",
+                    job_id=job_id,
+                    metadata={"requested": summary.requested, "failed": summary.failed},
+                )
+                logger.info(
+                    "Refresh job completed job_id=%s requested=%s failed=%s",
+                    job_id,
+                    summary.requested,
+                    summary.failed,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Refresh job failed job_id=%s", job_id)
+                fail_sync_job(
+                    ctx.settings,
+                    job_id=job_id,
+                    finished_at=datetime.now(UTC).isoformat(),
+                    error=str(exc),
+                )
+                add_event(
+                    ctx.settings,
+                    event_type="refresh_failed",
+                    message="Statement refresh job failed",
+                    level="error",
+                    job_id=job_id,
+                    metadata={"error": str(exc)},
+                )
+
+        Thread(target=run_refresh, daemon=True).start()
+        return job_id
+
+    @app.post("/api/sync/start")
+    def start_sync(payload: SyncStartRequest) -> dict[str, str]:
+        return {"job_id": _launch_sync_job(payload, trigger="manual")}
+
+    @app.post("/api/refresh/start")
+    def start_refresh() -> dict[str, str]:
+        return {"job_id": _launch_refresh_job(trigger="manual")}
 
     @app.get("/api/sync/status/{job_id}")
     def get_sync_status(job_id: str) -> SyncJobState:
@@ -596,11 +739,21 @@ def create_app(
         return job
 
     @app.get("/api/sync/jobs")
-    def list_sync_jobs() -> list[SyncJobState]:
-        jobs = [SyncJobState.model_validate(row) for row in list_persisted_sync_jobs(ctx.settings)]
+    def list_sync_jobs(job_type: str | None = None) -> list[SyncJobState]:
+        jobs = [
+            SyncJobState.model_validate(row)
+            for row in list_persisted_sync_jobs(ctx.settings, job_type=job_type)
+        ]
         for job in jobs:
             job.logs = []
         return sorted(jobs, key=lambda value: value.started_at, reverse=True)
+
+    @app.get("/api/jobs/summary")
+    def jobs_summary() -> dict[str, Any]:
+        return {
+            "refresh": get_latest_job(ctx.settings, "refresh"),
+            "sync": get_latest_job(ctx.settings, "sync"),
+        }
 
     @app.get("/api/events")
     def query_events(
@@ -652,5 +805,30 @@ def create_app(
         def frontend_spa_fallback(path: str) -> FileResponse:
             _ = path
             return FileResponse(frontend_dist / "index.html")
+
+    if enable_scheduler:
+
+        scheduled_sync_payload = SyncStartRequest()
+
+        def _scheduler_loop() -> None:
+            while True:
+                try:
+                    scheduler_tick(
+                        ctx.settings,
+                        launch_refresh=lambda: _launch_refresh_job(trigger="scheduled"),
+                        launch_sync=lambda: _launch_sync_job(
+                            scheduled_sync_payload, trigger="scheduled"
+                        ),
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("Scheduler tick failed")
+                time.sleep(SCHEDULER_POLL_SECONDS)
+
+        Thread(target=_scheduler_loop, daemon=True).start()
+        logger.info(
+            "Scheduler enabled refresh_interval_hours=%s fetch_after_refresh_hours=%s",
+            ctx.settings.refresh_interval_hours,
+            ctx.settings.fetch_after_refresh_hours,
+        )
 
     return app

@@ -92,6 +92,7 @@ def _initialize_database(path: Path) -> None:
 
             CREATE TABLE IF NOT EXISTS sync_jobs (
                 job_id TEXT PRIMARY KEY,
+                job_type TEXT NOT NULL DEFAULT 'sync',
                 status TEXT NOT NULL,
                 started_at TEXT NOT NULL,
                 finished_at TEXT,
@@ -100,11 +101,16 @@ def _initialize_database(path: Path) -> None:
                 downloaded INTEGER NOT NULL DEFAULT 0,
                 skipped_existing INTEGER NOT NULL DEFAULT 0,
                 skipped_filtered INTEGER NOT NULL DEFAULT 0,
-                errors INTEGER NOT NULL DEFAULT 0
+                errors INTEGER NOT NULL DEFAULT 0,
+                requested INTEGER,
+                failed INTEGER
             );
 
             CREATE INDEX IF NOT EXISTS idx_sync_jobs_started_at
             ON sync_jobs(started_at);
+
+            CREATE INDEX IF NOT EXISTS idx_sync_jobs_job_type
+            ON sync_jobs(job_type);
 
             CREATE TABLE IF NOT EXISTS service_config (
                 key TEXT PRIMARY KEY,
@@ -116,6 +122,16 @@ def _initialize_database(path: Path) -> None:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(linked_items)").fetchall()}
         if "institution_logo" not in columns:
             conn.execute("ALTER TABLE linked_items ADD COLUMN institution_logo TEXT")
+
+        sync_job_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(sync_jobs)").fetchall()
+        }
+        if "job_type" not in sync_job_columns:
+            conn.execute("ALTER TABLE sync_jobs ADD COLUMN job_type TEXT NOT NULL DEFAULT 'sync'")
+        if "requested" not in sync_job_columns:
+            conn.execute("ALTER TABLE sync_jobs ADD COLUMN requested INTEGER")
+        if "failed" not in sync_job_columns:
+            conn.execute("ALTER TABLE sync_jobs ADD COLUMN failed INTEGER")
         conn.commit()
     finally:
         conn.close()
@@ -765,15 +781,21 @@ def delete_service_configuration_keys(settings: Settings, keys: list[str]) -> No
         conn.commit()
 
 
-def create_sync_job(settings: Settings, job_id: str, started_at: str) -> None:
+def create_sync_job(
+    settings: Settings,
+    job_id: str,
+    started_at: str,
+    *,
+    job_type: str = "sync",
+) -> None:
     ensure_environment_files(settings)
     with _connect(settings) as conn:
         conn.execute(
             """
-            INSERT INTO sync_jobs (job_id, status, started_at)
-            VALUES (?, 'running', ?)
+            INSERT INTO sync_jobs (job_id, job_type, status, started_at)
+            VALUES (?, ?, 'running', ?)
             """,
-            (job_id, started_at),
+            (job_id, job_type, started_at),
         )
         conn.commit()
 
@@ -869,80 +891,144 @@ def fail_sync_job(settings: Settings, *, job_id: str, finished_at: str, error: s
         conn.commit()
 
 
+def update_refresh_job_progress(
+    settings: Settings,
+    *,
+    job_id: str,
+    requested: int,
+    failed: int,
+) -> None:
+    ensure_environment_files(settings)
+    with _connect(settings) as conn:
+        conn.execute(
+            "UPDATE sync_jobs SET requested = ?, failed = ? WHERE job_id = ?",
+            (requested, failed, job_id),
+        )
+        conn.commit()
+
+
+def complete_refresh_job(
+    settings: Settings,
+    *,
+    job_id: str,
+    finished_at: str,
+    requested: int,
+    failed: int,
+) -> None:
+    ensure_environment_files(settings)
+    with _connect(settings) as conn:
+        conn.execute(
+            """
+            UPDATE sync_jobs
+            SET
+                status = 'completed',
+                finished_at = ?,
+                requested = ?,
+                failed = ?
+            WHERE job_id = ?
+            """,
+            (finished_at, requested, failed, job_id),
+        )
+        conn.commit()
+
+
+_JOB_COLUMNS = (
+    "job_id",
+    "job_type",
+    "status",
+    "started_at",
+    "finished_at",
+    "error",
+    "listed",
+    "downloaded",
+    "skipped_existing",
+    "skipped_filtered",
+    "errors",
+    "requested",
+    "failed",
+)
+
+
+def _job_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {column: row[column] for column in _JOB_COLUMNS}
+
+
 def get_sync_job(settings: Settings, job_id: str) -> dict[str, Any] | None:
     ensure_environment_files(settings)
     with _connect(settings) as conn:
         row = conn.execute(
-            """
-            SELECT
-                job_id,
-                status,
-                started_at,
-                finished_at,
-                error,
-                listed,
-                downloaded,
-                skipped_existing,
-                skipped_filtered,
-                errors
-            FROM sync_jobs
-            WHERE job_id = ?
-            """,
+            f"SELECT {', '.join(_JOB_COLUMNS)} FROM sync_jobs WHERE job_id = ?",
             (job_id,),
         ).fetchone()
 
-    if row is None:
-        return None
-
-    return {
-        "job_id": row["job_id"],
-        "status": row["status"],
-        "started_at": row["started_at"],
-        "finished_at": row["finished_at"],
-        "error": row["error"],
-        "listed": row["listed"],
-        "downloaded": row["downloaded"],
-        "skipped_existing": row["skipped_existing"],
-        "skipped_filtered": row["skipped_filtered"],
-        "errors": row["errors"],
-    }
+    return _job_row_to_dict(row) if row is not None else None
 
 
-def list_sync_jobs(settings: Settings, limit: int = 200) -> list[dict[str, Any]]:
+def list_sync_jobs(
+    settings: Settings,
+    limit: int = 200,
+    *,
+    job_type: str | None = None,
+) -> list[dict[str, Any]]:
     ensure_environment_files(settings)
+    where_clause = "WHERE job_type = ?" if job_type else ""
+    args: list[Any] = [job_type] if job_type else []
+
     with _connect(settings) as conn:
         rows = conn.execute(
-            """
-            SELECT
-                job_id,
-                status,
-                started_at,
-                finished_at,
-                error,
-                listed,
-                downloaded,
-                skipped_existing,
-                skipped_filtered,
-                errors
+            f"""
+            SELECT {', '.join(_JOB_COLUMNS)}
             FROM sync_jobs
+            {where_clause}
             ORDER BY started_at DESC
             LIMIT ?
             """,
-            (limit,),
+            (*args, limit),
         ).fetchall()
 
-    return [
-        {
-            "job_id": row["job_id"],
-            "status": row["status"],
-            "started_at": row["started_at"],
-            "finished_at": row["finished_at"],
-            "error": row["error"],
-            "listed": row["listed"],
-            "downloaded": row["downloaded"],
-            "skipped_existing": row["skipped_existing"],
-            "skipped_filtered": row["skipped_filtered"],
-            "errors": row["errors"],
-        }
-        for row in rows
-    ]
+    return [_job_row_to_dict(row) for row in rows]
+
+
+def get_latest_job(settings: Settings, job_type: str) -> dict[str, Any] | None:
+    """Most recently started job of the given type, in any status."""
+    ensure_environment_files(settings)
+    with _connect(settings) as conn:
+        row = conn.execute(
+            f"""
+            SELECT {', '.join(_JOB_COLUMNS)}
+            FROM sync_jobs
+            WHERE job_type = ?
+            ORDER BY started_at DESC
+            LIMIT 1
+            """,
+            (job_type,),
+        ).fetchone()
+
+    return _job_row_to_dict(row) if row is not None else None
+
+
+def get_latest_completed_job(settings: Settings, job_type: str) -> dict[str, Any] | None:
+    ensure_environment_files(settings)
+    with _connect(settings) as conn:
+        row = conn.execute(
+            f"""
+            SELECT {', '.join(_JOB_COLUMNS)}
+            FROM sync_jobs
+            WHERE job_type = ? AND status = 'completed'
+            ORDER BY finished_at DESC
+            LIMIT 1
+            """,
+            (job_type,),
+        ).fetchone()
+
+    return _job_row_to_dict(row) if row is not None else None
+
+
+def has_running_job(settings: Settings, job_type: str) -> bool:
+    ensure_environment_files(settings)
+    with _connect(settings) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM sync_jobs WHERE job_type = ? AND status = 'running' LIMIT 1",
+            (job_type,),
+        ).fetchone()
+    return row is not None

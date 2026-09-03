@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 
 import httpx
 
-from statement_fetcher.app import create_app
+from statement_fetcher.app import create_app, scheduler_tick
 from statement_fetcher.models import DownloadedStatement, StateFile
 from statement_fetcher.settings import Settings
-from statement_fetcher.storage import add_event, complete_sync_job, create_sync_job, save_state
+from statement_fetcher.storage import (
+    add_event,
+    complete_refresh_job,
+    complete_sync_job,
+    create_sync_job,
+    save_state,
+)
 
 
 class FakePlaidClient:
@@ -269,6 +275,142 @@ def test_downloaded_statements_endpoints(tmp_path) -> None:
         assert missing_response.status_code == 404
 
     run_with_client(app, test_body)
+
+
+def test_refresh_and_sync_start_endpoints_run_to_completion(tmp_path) -> None:
+    # No linked items configured, so both jobs complete immediately without needing
+    # the fake Plaid client to implement list_statements/refresh_statements.
+    settings = Settings(plaid_env="sandbox", PSF_CONFIG_ROOT=tmp_path)
+    app = create_app(settings=settings, plaid_client=FakePlaidClient())
+
+    async def poll_until_finished(client: httpx.AsyncClient, job_id: str) -> dict:
+        for _ in range(50):
+            response = await client.get(f"/api/sync/status/{job_id}")
+            payload = response.json()
+            if payload["status"] != "running":
+                return payload
+            await asyncio.sleep(0.05)
+        raise AssertionError(f"job {job_id} did not finish in time")
+
+    async def test_body(client: httpx.AsyncClient) -> None:
+        refresh_response = await client.post("/api/refresh/start")
+        assert refresh_response.status_code == 200
+        refresh_job = await poll_until_finished(client, refresh_response.json()["job_id"])
+        assert refresh_job["status"] == "completed"
+        assert refresh_job["job_type"] == "refresh"
+        assert refresh_job["requested"] == 0
+
+        sync_response = await client.post("/api/sync/start", json={})
+        assert sync_response.status_code == 200
+        sync_job = await poll_until_finished(client, sync_response.json()["job_id"])
+        assert sync_job["status"] == "completed"
+        assert sync_job["job_type"] == "sync"
+
+        jobs_response = await client.get("/api/sync/jobs")
+        job_types = {job["job_type"] for job in jobs_response.json()}
+        assert job_types == {"refresh", "sync"}
+
+        refresh_only = await client.get("/api/sync/jobs", params={"job_type": "refresh"})
+        assert [job["job_type"] for job in refresh_only.json()] == ["refresh"]
+
+        summary_response = await client.get("/api/jobs/summary")
+        summary = summary_response.json()
+        assert summary["refresh"]["job_id"] == refresh_job["job_id"]
+        assert summary["sync"]["job_id"] == sync_job["job_id"]
+
+    run_with_client(app, test_body)
+
+
+def test_scheduler_tick_triggers_refresh_when_none_has_run(tmp_path) -> None:
+    settings = Settings(plaid_env="sandbox", PSF_CONFIG_ROOT=tmp_path)
+    refresh_calls = []
+    sync_calls = []
+
+    scheduler_tick(
+        settings,
+        launch_refresh=lambda: refresh_calls.append(1),
+        launch_sync=lambda: sync_calls.append(1),
+    )
+
+    assert refresh_calls == [1]
+    assert sync_calls == []  # no completed refresh yet, so fetch stays put
+
+
+def test_scheduler_tick_does_not_retrigger_running_refresh(tmp_path) -> None:
+    settings = Settings(plaid_env="sandbox", PSF_CONFIG_ROOT=tmp_path)
+    create_sync_job(settings, "refresh-running", "2026-01-01T00:00:00+00:00", job_type="refresh")
+
+    refresh_calls = []
+    scheduler_tick(
+        settings,
+        launch_refresh=lambda: refresh_calls.append(1),
+        launch_sync=lambda: None,
+    )
+
+    assert refresh_calls == []
+
+
+def test_scheduler_tick_waits_for_fetch_after_refresh_hours(tmp_path) -> None:
+    settings = Settings(
+        plaid_env="sandbox",
+        PSF_CONFIG_ROOT=tmp_path,
+        PSF_REFRESH_INTERVAL_HOURS=999,
+        PSF_FETCH_AFTER_REFRESH_HOURS=24,
+    )
+    now = datetime.now(UTC)
+    refresh_started = (now - timedelta(hours=1)).isoformat()
+    refresh_finished = (now - timedelta(hours=1)).isoformat()
+    create_sync_job(settings, "refresh-1", refresh_started, job_type="refresh")
+    complete_refresh_job(
+        settings, job_id="refresh-1", finished_at=refresh_finished, requested=1, failed=0
+    )
+
+    sync_calls = []
+    scheduler_tick(settings, launch_refresh=lambda: None, launch_sync=lambda: sync_calls.append(1))
+
+    # Refresh only finished an hour ago; fetch shouldn't run until 24h have passed.
+    assert sync_calls == []
+
+
+def test_scheduler_tick_triggers_fetch_once_per_completed_refresh(tmp_path) -> None:
+    settings = Settings(
+        plaid_env="sandbox",
+        PSF_CONFIG_ROOT=tmp_path,
+        PSF_REFRESH_INTERVAL_HOURS=999,
+        PSF_FETCH_AFTER_REFRESH_HOURS=24,
+    )
+    now = datetime.now(UTC)
+    old_enough = (now - timedelta(hours=25)).isoformat()
+    create_sync_job(settings, "refresh-1", old_enough, job_type="refresh")
+    complete_refresh_job(
+        settings, job_id="refresh-1", finished_at=old_enough, requested=1, failed=0
+    )
+
+    sync_calls = []
+    scheduler_tick(settings, launch_refresh=lambda: None, launch_sync=lambda: sync_calls.append(1))
+    assert sync_calls == [1]
+
+    # Simulate that fetch actually ran (as the real endpoint would record) and confirm
+    # the scheduler won't fire a second fetch for the same completed refresh.
+    create_sync_job(settings, "sync-1", now.isoformat(), job_type="sync")
+    complete_sync_job(
+        settings,
+        job_id="sync-1",
+        finished_at=now.isoformat(),
+        listed=0,
+        downloaded=0,
+        skipped_existing=0,
+        skipped_filtered=0,
+        errors=0,
+    )
+
+    sync_calls_second_tick = []
+    scheduler_tick(
+        settings,
+        launch_refresh=lambda: None,
+        launch_sync=lambda: sync_calls_second_tick.append(1),
+    )
+    assert sync_calls_second_tick == []
 
 
 def test_download_statement_rejects_path_outside_output_dir(tmp_path) -> None:

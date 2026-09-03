@@ -230,6 +230,24 @@ class PlaidClient:
     def list_statements(self, access_token: str) -> dict[str, Any]:
         return self._post("/statements/list", {"access_token": access_token})
 
+    def refresh_statements(self, access_token: str, start_date: date, end_date: date) -> str | None:
+        """Trigger Plaid to check the institution for statements posted since the last fetch.
+
+        Plaid's Statements product only fetches statements once, at Link time, for the
+        requested date window; it does not detect newly-posted statements on its own.
+        This must be called to make /statements/list return anything new. Returns the
+        Plaid request_id for the refresh, if provided.
+        """
+        response = self._post(
+            "/statements/refresh",
+            {
+                "access_token": access_token,
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+            },
+        )
+        return response.get("request_id")
+
     def download_statement(self, access_token: str, statement_id: str) -> tuple[bytes, str | None]:
         content, headers = self._post_binary(
             "/statements/download",

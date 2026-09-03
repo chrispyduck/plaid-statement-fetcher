@@ -102,3 +102,29 @@ def test_create_link_token_includes_statements_object() -> None:
     assert client.last_payload["products"] == ["statements"]
     assert client.last_payload["statements"]["start_date"]
     assert client.last_payload["statements"]["end_date"]
+
+
+def test_refresh_statements_posts_date_range_and_returns_request_id() -> None:
+    class CapturingPlaidClient(PlaidClient):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.last_endpoint: str | None = None
+            self.last_payload: dict | None = None
+
+        def _post(self, endpoint: str, payload: dict) -> dict:  # type: ignore[override]
+            self.last_endpoint = endpoint
+            self.last_payload = payload
+            return {"request_id": "req_abc"}
+
+    settings = Settings(plaid_env="sandbox", plaid_client_id="client", plaid_secret="secret")
+    client = CapturingPlaidClient(settings)
+
+    request_id = client.refresh_statements("access_1", date(2026, 1, 1), date(2026, 6, 30))
+
+    assert request_id == "req_abc"
+    assert client.last_endpoint == "/statements/refresh"
+    assert client.last_payload == {
+        "access_token": "access_1",
+        "start_date": "2026-01-01",
+        "end_date": "2026-06-30",
+    }

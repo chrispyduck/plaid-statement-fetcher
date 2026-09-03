@@ -7,7 +7,7 @@ import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 from .models import DownloadedStatement
@@ -25,6 +25,33 @@ class SyncSummary:
     skipped_existing: int = 0
     skipped_filtered: int = 0
     errors: int = 0
+
+
+@dataclass
+class RefreshSummary:
+    requested: int = 0
+    failed: int = 0
+
+
+def _make_pacer(settings: Settings) -> Callable[[], None]:
+    """Return a callable that sleeps as needed to respect the configured min interval
+    between Plaid requests, so repeated calls from a loop don't burst against Plaid.
+    """
+    min_interval = max(0.0, float(settings.sync_min_interval_seconds))
+    last_call = 0.0
+
+    def pace() -> None:
+        nonlocal last_call
+        if min_interval <= 0:
+            return
+        now = time.monotonic()
+        elapsed = now - last_call
+        wait_for = min_interval - elapsed
+        if wait_for > 0:
+            time.sleep(wait_for)
+        last_call = time.monotonic()
+
+    return pace
 
 
 def _sanitize_name(value: str) -> str:
@@ -119,6 +146,102 @@ def _retry_download(
             time.sleep(delay + jitter)
 
 
+def refresh_statements(
+    settings: Settings,
+    *,
+    plaid_client: PlaidClient | None = None,
+    progress_callback: Callable[[RefreshSummary], None] | None = None,
+    event_callback: Callable[[str, str, dict[str, str | int] | None], None] | None = None,
+) -> RefreshSummary:
+    """Ask Plaid to check each linked item's institution for newly-posted statements.
+
+    Plaid's Statements product only fetches statements once, at Link time, for the
+    requested date window; it does not detect newly-posted statements on its own.
+    /statements/list will not return anything new until this has been requested (and
+    Plaid has finished processing it, which happens asynchronously). This is
+    deliberately separate from sync_statements/list+download so the two can be run on
+    independent schedules.
+    """
+    logger.info("Statement refresh started")
+    summary = RefreshSummary()
+    client = plaid_client or PlaidClient(settings)
+    pace_plaid_requests = _make_pacer(settings)
+
+    config = load_configuration(settings)
+    state = load_state(settings)
+
+    for linked_item in config.linked_items:
+        item_account_ids = {account.account_id for account in linked_item.accounts}
+        known_statement_dates = [
+            entry.statement_date
+            for entry in state.downloaded_statements
+            if entry.account_id in item_account_ids
+        ]
+        refresh_end = settings.statements_end_date or date.today()
+        refresh_start = (
+            max(known_statement_dates)
+            if known_statement_dates
+            else settings.statements_start_date or (refresh_end - timedelta(days=730))
+        )
+        if refresh_start > refresh_end:
+            continue
+
+        pace_plaid_requests()
+        try:
+            request_id = client.refresh_statements(
+                linked_item.access_token,
+                refresh_start,
+                refresh_end,
+            )
+            logger.info(
+                "Requested statement refresh item_id=%s start=%s end=%s request_id=%s",
+                linked_item.item_id,
+                refresh_start,
+                refresh_end,
+                request_id,
+            )
+            summary.requested += 1
+            if event_callback:
+                event_callback(
+                    "statement_refresh_requested",
+                    "Requested Plaid check for newly posted statements",
+                    {
+                        "item_id": linked_item.item_id,
+                        "institution_name": linked_item.institution_name,
+                        "start_date": refresh_start.isoformat(),
+                        "end_date": refresh_end.isoformat(),
+                    },
+                )
+        except PlaidAPIError as exc:
+            # Best-effort: some items/institutions may not support refresh. A failure
+            # here just means /statements/list won't show anything new for this item
+            # until the next attempt.
+            summary.failed += 1
+            logger.warning(
+                "Statement refresh request failed item_id=%s: %s",
+                linked_item.item_id,
+                exc,
+            )
+            if event_callback:
+                event_callback(
+                    "statement_refresh_failed",
+                    "Requesting a statement refresh from Plaid failed",
+                    {
+                        "item_id": linked_item.item_id,
+                        "institution_name": linked_item.institution_name,
+                    },
+                )
+        if progress_callback:
+            progress_callback(summary)
+
+    logger.info(
+        "Statement refresh completed requested=%s failed=%s",
+        summary.requested,
+        summary.failed,
+    )
+    return summary
+
+
 def sync_statements(
     settings: Settings,
     *,
@@ -144,19 +267,7 @@ def sync_statements(
     state = load_state(settings)
     existing_keys = {entry.dedupe_key for entry in state.downloaded_statements}
     existing_entries = {entry.dedupe_key: entry for entry in state.downloaded_statements}
-    min_interval = max(0.0, float(settings.sync_min_interval_seconds))
-    last_plaid_call = 0.0
-
-    def pace_plaid_requests() -> None:
-        nonlocal last_plaid_call
-        if min_interval <= 0:
-            return
-        now = time.monotonic()
-        elapsed = now - last_plaid_call
-        wait_for = min_interval - elapsed
-        if wait_for > 0:
-            time.sleep(wait_for)
-        last_plaid_call = time.monotonic()
+    pace_plaid_requests = _make_pacer(settings)
 
     for linked_item in config.linked_items:
         logger.info(

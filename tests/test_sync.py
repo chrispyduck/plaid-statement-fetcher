@@ -3,14 +3,21 @@ from __future__ import annotations
 from datetime import date
 
 from statement_fetcher.models import LinkedAccount, LinkedItem
+from statement_fetcher.plaid_api import PlaidAPIError
 from statement_fetcher.settings import Settings
 from statement_fetcher.storage import load_state, upsert_linked_item
-from statement_fetcher.sync import sync_statements
+from statement_fetcher.sync import refresh_statements, sync_statements
 
 
 class FakeSyncPlaidClient:
     def __init__(self) -> None:
         self.download_calls = 0
+        self.refresh_calls: list[tuple[date, date]] = []
+
+    def refresh_statements(self, access_token: str, start_date: date, end_date: date) -> str | None:
+        assert access_token == "access_1"
+        self.refresh_calls.append((start_date, end_date))
+        return "req_1"
 
     def list_statements(self, access_token: str) -> dict:
         assert access_token == "access_1"
@@ -61,6 +68,9 @@ def test_sync_downloads_and_dedupes(tmp_path) -> None:
     assert second.downloaded == 0
     assert second.skipped_existing == 1
 
+    # sync_statements only lists/downloads; it never triggers a Plaid refresh itself.
+    assert client.refresh_calls == []
+
     state = load_state(settings)
     assert len(state.downloaded_statements) == 1
     assert "2026-06-30" in state.downloaded_statements[0].file_path
@@ -91,6 +101,9 @@ def test_sync_since_filter(tmp_path) -> None:
 
 
 class FakeSyncPlaidClientWithSparseAccounts:
+    def refresh_statements(self, access_token: str, start_date: date, end_date: date) -> str | None:
+        return "req_1"
+
     def list_statements(self, access_token: str) -> dict:
         assert access_token == "access_1"
         return {
@@ -142,3 +155,72 @@ def test_sync_logs_no_statement_and_unavailable_accounts(tmp_path) -> None:
     unavailable = [entry for entry in captured_events if entry[0] == "account_statement_unavailable"]
     assert unavailable[0][2] is not None
     assert unavailable[0][2]["account_id"] == "acc_2"
+
+
+def test_refresh_statements_narrows_window_from_known_statements(tmp_path) -> None:
+    settings = Settings(plaid_env="sandbox", PSF_CONFIG_ROOT=tmp_path)
+
+    linked_item = LinkedItem(
+        institution_id="ins_1",
+        institution_name="Chase",
+        item_id="item_1",
+        access_token="access_1",
+        accounts=[LinkedAccount(account_id="acc_1", account_name="Checking")],
+    )
+    upsert_linked_item(settings, linked_item)
+
+    client = FakeSyncPlaidClient()
+
+    # No prior statements for this item yet: falls back to the default 2-year lookback.
+    first = refresh_statements(settings, plaid_client=client)
+    assert first.requested == 1
+    assert first.failed == 0
+    assert len(client.refresh_calls) == 1
+
+    # Download a statement, then refresh again: the window should narrow to start
+    # from the newest statement already on disk.
+    sync_statements(settings, plaid_client=client)
+    refresh_statements(settings, plaid_client=client)
+
+    assert len(client.refresh_calls) == 2
+    assert client.refresh_calls[1][0] == date(2026, 6, 30)
+
+
+class FakeSyncPlaidClientRefreshFails:
+    def refresh_statements(self, access_token: str, start_date: date, end_date: date) -> str | None:
+        raise PlaidAPIError("refresh not supported", status_code=400)
+
+    def list_statements(self, access_token: str) -> dict:
+        raise AssertionError("refresh_statements should not call list_statements")
+
+    def download_statement(self, access_token: str, statement_id: str) -> tuple[bytes, str | None]:
+        raise AssertionError("refresh_statements should not download anything")
+
+
+def test_refresh_statements_handles_failure_per_item(tmp_path) -> None:
+    settings = Settings(plaid_env="sandbox", PSF_CONFIG_ROOT=tmp_path)
+
+    linked_item = LinkedItem(
+        institution_id="ins_1",
+        institution_name="Chase",
+        item_id="item_1",
+        access_token="access_1",
+        accounts=[LinkedAccount(account_id="acc_1", account_name="Checking")],
+    )
+    upsert_linked_item(settings, linked_item)
+
+    client = FakeSyncPlaidClientRefreshFails()
+    captured_events: list[tuple[str, str, dict[str, str | int] | None]] = []
+
+    summary = refresh_statements(
+        settings,
+        plaid_client=client,
+        event_callback=lambda event_type, message, metadata: captured_events.append(
+            (event_type, message, metadata)
+        ),
+    )
+
+    assert summary.requested == 0
+    assert summary.failed == 1
+    event_types = [event_type for event_type, _message, _metadata in captured_events]
+    assert "statement_refresh_failed" in event_types

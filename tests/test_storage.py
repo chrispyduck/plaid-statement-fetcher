@@ -3,14 +3,19 @@ from __future__ import annotations
 from statement_fetcher.models import LinkedAccount, LinkedItem
 from statement_fetcher.settings import Settings
 from statement_fetcher.storage import (
+    complete_refresh_job,
     complete_sync_job,
     create_sync_job,
     ensure_environment_files,
     fail_sync_job,
+    get_latest_completed_job,
+    get_latest_job,
     get_sync_job,
+    has_running_job,
     list_sync_jobs,
     load_configuration,
     remove_account_from_configuration,
+    update_refresh_job_progress,
     update_sync_job_progress,
     upsert_linked_item,
 )
@@ -182,3 +187,41 @@ def test_sync_job_failure_persisted(tmp_path) -> None:
     assert failed is not None
     assert failed["status"] == "failed"
     assert failed["error"] == "boom"
+
+
+def test_refresh_and_sync_jobs_are_tracked_independently(tmp_path) -> None:
+    settings = Settings(plaid_env="sandbox", PSF_CONFIG_ROOT=tmp_path)
+
+    create_sync_job(settings, "refresh-1", "2026-01-01T00:00:00+00:00", job_type="refresh")
+    create_sync_job(settings, "sync-1", "2026-01-01T00:00:00+00:00", job_type="sync")
+
+    assert has_running_job(settings, "refresh") is True
+    assert has_running_job(settings, "sync") is True
+
+    update_refresh_job_progress(settings, job_id="refresh-1", requested=2, failed=1)
+    complete_refresh_job(
+        settings,
+        job_id="refresh-1",
+        finished_at="2026-01-01T00:01:00+00:00",
+        requested=3,
+        failed=1,
+    )
+
+    assert has_running_job(settings, "refresh") is False
+    refreshed = get_sync_job(settings, "refresh-1")
+    assert refreshed is not None
+    assert refreshed["job_type"] == "refresh"
+    assert refreshed["status"] == "completed"
+    assert refreshed["requested"] == 3
+    assert refreshed["failed"] == 1
+    # Fetch-specific counters stay untouched by a refresh job.
+    assert refreshed["listed"] == 0
+    assert refreshed["downloaded"] == 0
+
+    assert list_sync_jobs(settings, job_type="refresh") == [refreshed]
+    assert [job["job_id"] for job in list_sync_jobs(settings, job_type="sync")] == ["sync-1"]
+    assert len(list_sync_jobs(settings)) == 2
+
+    assert get_latest_job(settings, "refresh")["job_id"] == "refresh-1"
+    assert get_latest_completed_job(settings, "refresh")["job_id"] == "refresh-1"
+    assert get_latest_completed_job(settings, "sync") is None
