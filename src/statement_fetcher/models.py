@@ -26,6 +26,8 @@ class LinkedItem(BaseModel):
     accounts: list[LinkedAccount] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    login_required: bool = False
+    login_required_at: datetime | None = None
 
 
 class ConfigurationFile(BaseModel):

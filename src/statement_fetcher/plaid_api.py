@@ -176,20 +176,26 @@ class PlaidClient:
             "end_date": end_date.isoformat(),
         }
 
-    def create_link_token(self, origin: str | None) -> str:
+    def create_link_token(self, origin: str | None, access_token: str | None = None) -> str:
         redirect_uri = self._resolve_redirect_uri(origin)
-        products = self._products()
 
-        payload = {
+        payload: dict[str, Any] = {
             "client_name": "Statement Fetcher",
             "language": self._normalize_language(self._settings.plaid_language),
             "country_codes": [self._settings.plaid_country_codes],
-            "products": products,
             "redirect_uri": redirect_uri,
             "user": {"client_user_id": "statement-fetcher-local-user"},
         }
-        if "statements" in products:
-            payload["statements"] = self._statements_window()
+
+        if access_token:
+            # Update mode: re-authenticates the existing item in place rather than
+            # creating a new one, so "products" is implied by the item and omitted.
+            payload["access_token"] = access_token
+        else:
+            products = self._products()
+            payload["products"] = products
+            if "statements" in products:
+                payload["statements"] = self._statements_window()
 
         response = self._post("/link/token/create", payload)
         link_token = response.get("link_token")

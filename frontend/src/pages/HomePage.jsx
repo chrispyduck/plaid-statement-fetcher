@@ -7,6 +7,7 @@ import {
   Button,
   Card,
   CardContent,
+  Chip,
   CircularProgress,
   Stack,
   Table,
@@ -19,7 +20,8 @@ import {
 import LinkIcon from '@mui/icons-material/Link';
 import VisibilityIcon from '@mui/icons-material/Visibility';
 import SyncIcon from '@mui/icons-material/Sync';
-import { apiBaseUrl, fetchJson, plaidOriginUrl, parseApiError } from '../api';
+import WarningAmberIcon from '@mui/icons-material/WarningAmber';
+import { apiBaseUrl, fetchJson, plaidOriginUrl, parseApiError, reconnectLinkedItem } from '../api';
 
 function institutionPalette(institutionId, institutionName) {
   const source = String(institutionId || institutionName || '?');
@@ -59,6 +61,7 @@ function HomePage() {
   const [backendEnv, setBackendEnv] = useState('unknown');
   const [isLoadingAccounts, setIsLoadingAccounts] = useState(false);
   const [isLinking, setIsLinking] = useState(false);
+  const [reconnectingAccountId, setReconnectingAccountId] = useState(null);
   const [statusMessage, setStatusMessage] = useState('');
   const [errorMessage, setErrorMessage] = useState('');
 
@@ -155,6 +158,32 @@ function HomePage() {
     }
   };
 
+  const reconnectRow = async (row) => {
+    setReconnectingAccountId(row.account_id);
+    setStatusMessage('Opening Plaid to reconnect...');
+    setErrorMessage('');
+
+    try {
+      const result = await reconnectLinkedItem({
+        itemId: row.item_id,
+        accountId: row.account_id,
+        onStatus: setStatusMessage,
+      });
+      if (result.cancelled) {
+        setStatusMessage('');
+      } else {
+        await fetchAccounts();
+        setStatusMessage('Account reconnected successfully.');
+      }
+    } catch (error) {
+      console.error('Reconnect failed', error);
+      setErrorMessage(`Failed to reconnect: ${String(error)}`);
+      setStatusMessage('');
+    } finally {
+      setReconnectingAccountId(null);
+    }
+  };
+
   return (
     <Stack spacing={2}>
       <Card variant="outlined" sx={{ borderRadius: 3 }}>
@@ -190,6 +219,13 @@ function HomePage() {
             {!!statusMessage && <Alert severity="success">{statusMessage}</Alert>}
             {!!errorMessage && <Alert severity="error">{errorMessage}</Alert>}
 
+            {accounts.some((row) => row.login_required) && (
+              <Alert severity="warning">
+                One or more institutions need you to reconnect before statements can sync. Click
+                Reconnect next to the affected account below.
+              </Alert>
+            )}
+
             <Box sx={{ overflowX: 'auto' }}>
               <Table size="small">
                 <TableHead>
@@ -197,13 +233,14 @@ function HomePage() {
                     <TableCell>Institution</TableCell>
                     <TableCell>Account</TableCell>
                     <TableCell>Alias</TableCell>
+                    <TableCell>Status</TableCell>
                     <TableCell>Details</TableCell>
                   </TableRow>
                 </TableHead>
                 <TableBody>
                   {accounts.length === 0 && !isLoadingAccounts ? (
                     <TableRow>
-                      <TableCell colSpan={4}>No linked accounts yet.</TableCell>
+                      <TableCell colSpan={5}>No linked accounts yet.</TableCell>
                     </TableRow>
                   ) : (
                     accounts.map((row) => (
@@ -233,6 +270,30 @@ function HomePage() {
                         </TableCell>
                         <TableCell>{row.account_name}</TableCell>
                         <TableCell>{row.alias || '—'}</TableCell>
+                        <TableCell>
+                          {row.login_required ? (
+                            <Button
+                              size="small"
+                              variant="contained"
+                              color="warning"
+                              startIcon={
+                                reconnectingAccountId === row.account_id ? (
+                                  <CircularProgress size={14} color="inherit" />
+                                ) : (
+                                  <WarningAmberIcon />
+                                )
+                              }
+                              disabled={reconnectingAccountId === row.account_id}
+                              onClick={() => reconnectRow(row)}
+                            >
+                              {reconnectingAccountId === row.account_id
+                                ? 'Reconnecting...'
+                                : 'Reconnect'}
+                            </Button>
+                          ) : (
+                            <Chip size="small" variant="outlined" label="Connected" />
+                          )}
+                        </TableCell>
                         <TableCell>
                           <Button
                             size="small"

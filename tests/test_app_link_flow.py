@@ -8,6 +8,7 @@ import httpx
 
 from statement_fetcher.app import create_app, scheduler_tick
 from statement_fetcher.models import DownloadedStatement, StateFile
+from statement_fetcher.plaid_api import PlaidAPIError
 from statement_fetcher.settings import Settings
 from statement_fetcher.storage import (
     add_event,
@@ -317,6 +318,92 @@ def test_refresh_and_sync_start_endpoints_run_to_completion(tmp_path) -> None:
         summary = summary_response.json()
         assert summary["refresh"]["job_id"] == refresh_job["job_id"]
         assert summary["sync"]["job_id"] == sync_job["job_id"]
+
+    run_with_client(app, test_body)
+
+
+class FakeTwoItemPlaidClient:
+    """Chase (ITEM_LOGIN_REQUIRED) and Citibank (healthy), linked as separate items."""
+
+    def create_link_token(self, origin: str | None) -> str:
+        return "link-token"
+
+    def exchange_public_token(self, public_token: str) -> tuple[str, str]:
+        if public_token == "public-chase":
+            return "access-chase", "item-chase"
+        if public_token == "public-citi":
+            return "access-citi", "item-citi"
+        raise AssertionError(public_token)
+
+    def get_accounts(self, access_token: str) -> tuple[list[dict[str, str]], str]:
+        if access_token == "access-chase":
+            return [{"account_id": "acc-chase", "name": "Chase Checking"}], "ins_56"
+        if access_token == "access-citi":
+            return [{"account_id": "acc-citi", "name": "Citi Checking"}], "ins_5"
+        raise AssertionError(access_token)
+
+    def get_institution_name(self, institution_id: str | None) -> tuple[str, str, str | None]:
+        names = {
+            "ins_56": "Chase",
+            "ins_5": "Citibank Online",
+        }
+        return institution_id, names[institution_id], None
+
+    def refresh_statements(self, access_token: str, start_date, end_date) -> str | None:
+        return "req_1"
+
+    def list_statements(self, access_token: str) -> dict:
+        if access_token == "access-chase":
+            raise PlaidAPIError(
+                "Plaid API request failed",
+                status_code=400,
+                details={"error_code": "ITEM_LOGIN_REQUIRED", "request_id": "req_x"},
+            )
+        return {"institution_name": "Citibank Online", "accounts": []}
+
+    def download_statement(self, access_token: str, statement_id: str) -> tuple[bytes, str | None]:
+        raise AssertionError("no downloads expected in this test")
+
+
+def test_sync_job_completes_and_flags_reauth_when_one_item_needs_login(tmp_path) -> None:
+    # Regression test: a sync job used to crash entirely (status="failed") the moment
+    # any single linked item's /statements/list call raised ITEM_LOGIN_REQUIRED, which
+    # meant every item after the failing one in iteration order was silently skipped.
+    settings = Settings(plaid_env="sandbox", PSF_CONFIG_ROOT=tmp_path)
+    app = create_app(settings=settings, plaid_client=FakeTwoItemPlaidClient())
+
+    async def poll_until_finished(client: httpx.AsyncClient, job_id: str) -> dict:
+        for _ in range(50):
+            response = await client.get(f"/api/sync/status/{job_id}")
+            payload = response.json()
+            if payload["status"] != "running":
+                return payload
+            await asyncio.sleep(0.05)
+        raise AssertionError(f"job {job_id} did not finish in time")
+
+    async def test_body(client: httpx.AsyncClient) -> None:
+        await client.post("/api/plaid/link/exchange", json={"public_token": "public-chase"})
+        await client.post("/api/plaid/link/exchange", json={"public_token": "public-citi"})
+
+        sync_response = await client.post("/api/sync/start", json={})
+        job = await poll_until_finished(client, sync_response.json()["job_id"])
+
+        assert job["status"] == "completed"
+        assert job["errors"] == 1
+
+        event_types = {entry["event_type"] for entry in job["logs"]}
+        assert "item_login_required" in event_types
+        login_required_log = next(
+            entry for entry in job["logs"] if entry["event_type"] == "item_login_required"
+        )
+        assert login_required_log["item_id"] == "item-chase"
+        assert login_required_log["level"] == "error"
+        assert login_required_log["metadata"]["reauth_required"] is True
+
+        accounts_response = await client.get("/api/accounts")
+        accounts_by_id = {row["account_id"]: row for row in accounts_response.json()}
+        assert accounts_by_id["acc-chase"]["login_required"] is True
+        assert accounts_by_id["acc-citi"]["login_required"] is False
 
     run_with_client(app, test_body)
 

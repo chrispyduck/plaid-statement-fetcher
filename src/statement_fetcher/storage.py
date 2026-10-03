@@ -41,7 +41,9 @@ def _initialize_database(path: Path) -> None:
                 institution_logo TEXT,
                 access_token TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                login_required INTEGER NOT NULL DEFAULT 0,
+                login_required_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS linked_accounts (
@@ -119,6 +121,12 @@ def _initialize_database(path: Path) -> None:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(linked_items)").fetchall()}
         if "institution_logo" not in columns:
             conn.execute("ALTER TABLE linked_items ADD COLUMN institution_logo TEXT")
+        if "login_required" not in columns:
+            conn.execute(
+                "ALTER TABLE linked_items ADD COLUMN login_required INTEGER NOT NULL DEFAULT 0"
+            )
+        if "login_required_at" not in columns:
+            conn.execute("ALTER TABLE linked_items ADD COLUMN login_required_at TEXT")
 
         sync_job_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(sync_jobs)").fetchall()
@@ -151,7 +159,9 @@ def load_configuration(settings: Settings) -> ConfigurationFile:
                 institution_logo,
                 access_token,
                 created_at,
-                updated_at
+                updated_at,
+                login_required,
+                login_required_at
             FROM linked_items
             ORDER BY institution_name, item_id
             """
@@ -198,6 +208,12 @@ def load_configuration(settings: Settings) -> ConfigurationFile:
                 accounts=accounts_by_item_id.get(row["item_id"], []),
                 created_at=datetime.fromisoformat(row["created_at"]),
                 updated_at=datetime.fromisoformat(row["updated_at"]),
+                login_required=bool(row["login_required"]),
+                login_required_at=(
+                    datetime.fromisoformat(row["login_required_at"])
+                    if row["login_required_at"]
+                    else None
+                ),
             )
         )
 
@@ -407,14 +423,18 @@ def upsert_linked_item(settings: Settings, linked_item: LinkedItem) -> None:
                 institution_logo,
                 access_token,
                 created_at,
-                updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                updated_at,
+                login_required,
+                login_required_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL)
             ON CONFLICT(item_id) DO UPDATE SET
                 institution_id = excluded.institution_id,
                 institution_name = excluded.institution_name,
                 institution_logo = excluded.institution_logo,
                 access_token = excluded.access_token,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                login_required = 0,
+                login_required_at = NULL
             """,
             (
                 linked_item.item_id,
@@ -467,6 +487,33 @@ def upsert_linked_item(settings: Settings, linked_item: LinkedItem) -> None:
         conn.commit()
 
 
+def set_item_login_required(
+    settings: Settings,
+    item_id: str,
+    *,
+    required: bool,
+) -> bool:
+    """Record whether Plaid is reporting ITEM_LOGIN_REQUIRED for a linked item.
+
+    Cleared automatically by `upsert_linked_item` whenever a Plaid call against the
+    item succeeds again (manual refresh, reconnect, or a later sync/refresh job).
+    """
+    ensure_environment_files(settings)
+    now = datetime.now(UTC).isoformat() if required else None
+    with _connect(settings) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE linked_items
+            SET login_required = ?, login_required_at = ?
+            WHERE item_id = ?
+            """,
+            (1 if required else 0, now, item_id),
+        )
+        changed = cursor.rowcount > 0
+        conn.commit()
+    return changed
+
+
 def set_account_alias(settings: Settings, account_id: str, alias: str | None) -> bool:
     ensure_environment_files(settings)
     with _connect(settings) as conn:
@@ -503,7 +550,9 @@ def get_account_details(settings: Settings, account_id: str) -> dict[str, Any] |
                 li.institution_id,
                 li.institution_name,
                 li.created_at,
-                li.updated_at
+                li.updated_at,
+                li.login_required,
+                li.login_required_at
             FROM linked_accounts la
             INNER JOIN linked_items li ON la.item_id = li.item_id
             WHERE la.account_id = ?
@@ -526,6 +575,8 @@ def get_account_details(settings: Settings, account_id: str) -> dict[str, Any] |
         "institution_name": row["institution_name"],
         "linked_created_at": row["created_at"],
         "linked_updated_at": row["updated_at"],
+        "login_required": bool(row["login_required"]),
+        "login_required_at": row["login_required_at"],
     }
 
 

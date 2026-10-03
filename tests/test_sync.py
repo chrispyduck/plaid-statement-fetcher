@@ -5,7 +5,7 @@ from datetime import date
 from statement_fetcher.models import LinkedAccount, LinkedItem
 from statement_fetcher.plaid_api import PlaidAPIError
 from statement_fetcher.settings import Settings
-from statement_fetcher.storage import load_state, upsert_linked_item
+from statement_fetcher.storage import load_configuration, load_state, upsert_linked_item
 from statement_fetcher.sync import refresh_statements, sync_statements
 
 
@@ -195,6 +195,127 @@ class FakeSyncPlaidClientRefreshFails:
 
     def download_statement(self, access_token: str, statement_id: str) -> tuple[bytes, str | None]:
         raise AssertionError("refresh_statements should not download anything")
+
+
+class FakeSyncPlaidClientOneItemLoginRequired:
+    """Chase (access_1) needs reauth; Citibank (access_2) is healthy.
+
+    Regression test for a bug where a single item's ITEM_LOGIN_REQUIRED error during
+    sync_statements aborted the whole job, so no items after the failing one were ever
+    attempted.
+    """
+
+    def list_statements(self, access_token: str) -> dict:
+        if access_token == "access_1":
+            raise PlaidAPIError(
+                "Plaid API request failed",
+                status_code=400,
+                details={"error_code": "ITEM_LOGIN_REQUIRED", "request_id": "req_1"},
+            )
+        assert access_token == "access_2"
+        return {
+            "institution_name": "Citibank Online",
+            "accounts": [
+                {
+                    "account_id": "acc_2",
+                    "account_name": "Checking",
+                    "statements": [
+                        {
+                            "statement_id": "stmt_2",
+                            "date_posted": "2026-06-30",
+                            "month": 6,
+                            "year": 2026,
+                        }
+                    ],
+                }
+            ],
+        }
+
+    def download_statement(self, access_token: str, statement_id: str) -> tuple[bytes, str | None]:
+        assert access_token == "access_2"
+        assert statement_id == "stmt_2"
+        return b"%PDF-1.7 fake", None
+
+
+def test_sync_continues_past_item_with_login_required(tmp_path) -> None:
+    settings = Settings(plaid_env="sandbox", PSF_CONFIG_ROOT=tmp_path)
+
+    upsert_linked_item(
+        settings,
+        LinkedItem(
+            institution_id="ins_56",
+            institution_name="Chase",
+            item_id="item_1",
+            access_token="access_1",
+            accounts=[LinkedAccount(account_id="acc_1", account_name="Checking")],
+        ),
+    )
+    upsert_linked_item(
+        settings,
+        LinkedItem(
+            institution_id="ins_5",
+            institution_name="Citibank Online",
+            item_id="item_2",
+            access_token="access_2",
+            accounts=[LinkedAccount(account_id="acc_2", account_name="Checking")],
+        ),
+    )
+
+    client = FakeSyncPlaidClientOneItemLoginRequired()
+    captured_events: list[tuple[str, str, dict[str, str | int] | None]] = []
+
+    summary = sync_statements(
+        settings,
+        plaid_client=client,
+        event_callback=lambda event_type, message, metadata: captured_events.append(
+            (event_type, message, metadata)
+        ),
+    )
+
+    # The failing item (Chase) must not prevent the healthy item (Citibank) after it
+    # from being listed and downloaded.
+    assert summary.downloaded == 1
+    assert summary.errors == 1
+
+    event_types = [event_type for event_type, _message, _metadata in captured_events]
+    assert "item_login_required" in event_types
+    login_required_event = next(
+        entry for entry in captured_events if entry[0] == "item_login_required"
+    )
+    assert login_required_event[2]["item_id"] == "item_1"
+    assert login_required_event[2]["reauth_required"] is True
+
+    config = load_configuration(settings)
+    items_by_id = {item.item_id: item for item in config.linked_items}
+    assert items_by_id["item_1"].login_required is True
+    assert items_by_id["item_2"].login_required is False
+
+
+def test_sync_clears_login_required_once_item_recovers(tmp_path) -> None:
+    settings = Settings(plaid_env="sandbox", PSF_CONFIG_ROOT=tmp_path)
+
+    upsert_linked_item(
+        settings,
+        LinkedItem(
+            institution_id="ins_1",
+            institution_name="Chase",
+            item_id="item_1",
+            access_token="access_1",
+            accounts=[LinkedAccount(account_id="acc_1", account_name="Checking")],
+        ),
+    )
+
+    failing_client = FakeSyncPlaidClientOneItemLoginRequired()
+    sync_statements(settings, plaid_client=failing_client)
+
+    config = load_configuration(settings)
+    assert config.linked_items[0].login_required is True
+
+    recovered_client = FakeSyncPlaidClient()
+    sync_statements(settings, plaid_client=recovered_client)
+
+    config = load_configuration(settings)
+    assert config.linked_items[0].login_required is False
 
 
 def test_refresh_statements_handles_failure_per_item(tmp_path) -> None:

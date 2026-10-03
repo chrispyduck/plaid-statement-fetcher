@@ -18,9 +18,10 @@ import {
 } from '@mui/material';
 import ArrowBackIcon from '@mui/icons-material/ArrowBack';
 import DeleteIcon from '@mui/icons-material/Delete';
+import LinkIcon from '@mui/icons-material/Link';
 import SaveIcon from '@mui/icons-material/Save';
 import SyncIcon from '@mui/icons-material/Sync';
-import { fetchJson } from '../api';
+import { fetchJson, reconnectLinkedItem } from '../api';
 import EventLogTable from '../components/EventLogTable';
 
 function AccountDetailsPage() {
@@ -32,6 +33,7 @@ function AccountDetailsPage() {
   const [isSaving, setIsSaving] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isRemoving, setIsRemoving] = useState(false);
+  const [isReconnecting, setIsReconnecting] = useState(false);
   const [showConfirm, setShowConfirm] = useState(false);
   const [statusMessage, setStatusMessage] = useState('');
   const [errorMessage, setErrorMessage] = useState('');
@@ -108,6 +110,32 @@ function AccountDetailsPage() {
     }
   };
 
+  const reconnectAccount = async () => {
+    setIsReconnecting(true);
+    setStatusMessage('Opening Plaid to reconnect...');
+    setErrorMessage('');
+
+    try {
+      const result = await reconnectLinkedItem({
+        itemId: details.item_id,
+        accountId,
+        onStatus: setStatusMessage,
+      });
+      if (result.cancelled) {
+        setStatusMessage('');
+      } else {
+        await loadDetails();
+        setStatusMessage('Account reconnected successfully.');
+      }
+    } catch (error) {
+      console.error('Reconnect failed', error);
+      setErrorMessage(`Failed to reconnect: ${String(error)}`);
+      setStatusMessage('');
+    } finally {
+      setIsReconnecting(false);
+    }
+  };
+
   if (isLoading) {
     return (
       <Stack direction="row" spacing={1} alignItems="center">
@@ -147,6 +175,19 @@ function AccountDetailsPage() {
             >
               <Typography variant="h5">Account Configuration</Typography>
               <Stack direction="row" spacing={1} justifyContent="flex-end">
+                {details.login_required && (
+                  <Button
+                    variant="contained"
+                    color="warning"
+                    startIcon={
+                      isReconnecting ? <CircularProgress size={16} color="inherit" /> : <LinkIcon />
+                    }
+                    disabled={isReconnecting || isRefreshing || isRemoving}
+                    onClick={reconnectAccount}
+                  >
+                    {isReconnecting ? 'Reconnecting...' : 'Reconnect'}
+                  </Button>
+                )}
                 <Button
                   variant="outlined"
                   startIcon={
@@ -172,6 +213,14 @@ function AccountDetailsPage() {
             </Stack>
             {!!statusMessage && <Alert severity="success">{statusMessage}</Alert>}
             {!!errorMessage && <Alert severity="error">{errorMessage}</Alert>}
+            {details.login_required && (
+              <Alert severity="warning">
+                Plaid reports that this institution needs you to sign in again before statements
+                can sync. Click Reconnect to re-authenticate.
+                {details.login_required_at &&
+                  ` (flagged ${new Date(details.login_required_at).toLocaleString()})`}
+              </Alert>
+            )}
 
             <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
               <TextField

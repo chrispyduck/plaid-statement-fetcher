@@ -10,10 +10,11 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 
-from .models import DownloadedStatement
+from .logging_utils import set_log_context
+from .models import DownloadedStatement, LinkedItem
 from .plaid_api import PlaidAPIError, PlaidClient
 from .settings import Settings
-from .storage import load_configuration, load_state, save_state
+from .storage import load_configuration, load_state, save_state, set_item_login_required
 
 logger = logging.getLogger(__name__)
 
@@ -146,12 +147,49 @@ def _retry_download(
             time.sleep(delay + jitter)
 
 
+def _plaid_error_code(exc: PlaidAPIError) -> tuple[str | None, bool]:
+    """Return (error_code, reauth_required) for a Plaid error."""
+    error_code = (exc.details or {}).get("error_code")
+    return error_code, error_code == "ITEM_LOGIN_REQUIRED"
+
+
+def _note_item_plaid_error(
+    settings: Settings,
+    linked_item: LinkedItem,
+    exc: PlaidAPIError,
+    event_callback: Callable[[str, str, dict[str, str | int] | None], None] | None,
+    *,
+    event_type: str,
+    message: str,
+) -> bool:
+    """Record a Plaid failure against a linked item, flagging ITEM_LOGIN_REQUIRED so the
+    UI can surface it and the next successful call against the item clears it again.
+    Returns whether the item needs reauthentication.
+    """
+    error_code, reauth_required = _plaid_error_code(exc)
+    if reauth_required:
+        set_item_login_required(settings, linked_item.item_id, required=True)
+    if event_callback:
+        event_callback(
+            event_type,
+            message,
+            {
+                "item_id": linked_item.item_id,
+                "institution_name": linked_item.institution_name,
+                "error_code": error_code,
+                "reauth_required": reauth_required,
+            },
+        )
+    return reauth_required
+
+
 def refresh_statements(
     settings: Settings,
     *,
     plaid_client: PlaidClient | None = None,
     progress_callback: Callable[[RefreshSummary], None] | None = None,
     event_callback: Callable[[str, str, dict[str, str | int] | None], None] | None = None,
+    job_id: str | None = None,
 ) -> RefreshSummary:
     """Ask Plaid to check each linked item's institution for newly-posted statements.
 
@@ -162,15 +200,18 @@ def refresh_statements(
     deliberately separate from sync_statements/list+download so the two can be run on
     independent schedules.
     """
-    logger.info("Statement refresh started")
+    set_log_context(job_id=job_id)
+    logger.info("Statement refresh started job_id=%s", job_id)
     summary = RefreshSummary()
     client = plaid_client or PlaidClient(settings)
     pace_plaid_requests = _make_pacer(settings)
 
     config = load_configuration(settings)
     state = load_state(settings)
+    logger.info("Statement refresh covers %s linked item(s)", len(config.linked_items))
 
     for linked_item in config.linked_items:
+        set_log_context(job_id=job_id, institution=linked_item.institution_name)
         item_account_ids = {account.account_id for account in linked_item.accounts}
         known_statement_dates = [
             entry.statement_date
@@ -184,6 +225,14 @@ def refresh_statements(
             else settings.statements_start_date or (refresh_end - timedelta(days=730))
         )
         if refresh_start > refresh_end:
+            logger.info(
+                "Skipping refresh for item_id=%s institution=%s: already up to date "
+                "(latest known statement=%s, refresh window ends=%s)",
+                linked_item.item_id,
+                linked_item.institution_name,
+                refresh_start,
+                refresh_end,
+            )
             continue
 
         pace_plaid_requests()
@@ -222,22 +271,23 @@ def refresh_statements(
                 linked_item.item_id,
                 exc,
             )
-            if event_callback:
-                event_callback(
-                    "statement_refresh_failed",
-                    "Requesting a statement refresh from Plaid failed",
-                    {
-                        "item_id": linked_item.item_id,
-                        "institution_name": linked_item.institution_name,
-                    },
-                )
+            _note_item_plaid_error(
+                settings,
+                linked_item,
+                exc,
+                event_callback,
+                event_type="statement_refresh_failed",
+                message="Requesting a statement refresh from Plaid failed",
+            )
         if progress_callback:
             progress_callback(summary)
 
+    set_log_context(job_id=job_id)
     logger.info(
-        "Statement refresh completed requested=%s failed=%s",
+        "Statement refresh completed requested=%s failed=%s job_id=%s",
         summary.requested,
         summary.failed,
+        job_id,
     )
     return summary
 
@@ -252,9 +302,12 @@ def sync_statements(
     max_downloads: int | None = None,
     progress_callback: Callable[[SyncSummary], None] | None = None,
     event_callback: Callable[[str, str, dict[str, str | int] | None], None] | None = None,
+    job_id: str | None = None,
 ) -> SyncSummary:
+    set_log_context(job_id=job_id)
     logger.info(
-        "Sync started dry_run=%s since=%s account_id=%s max_downloads=%s",
+        "Sync started job_id=%s dry_run=%s since=%s account_id=%s max_downloads=%s",
+        job_id,
         dry_run,
         since,
         account_id,
@@ -268,8 +321,16 @@ def sync_statements(
     existing_keys = {entry.dedupe_key for entry in state.downloaded_statements}
     existing_entries = {entry.dedupe_key: entry for entry in state.downloaded_statements}
     pace_plaid_requests = _make_pacer(settings)
+    logger.info("Sync covers %s linked item(s)", len(config.linked_items))
 
     for linked_item in config.linked_items:
+        set_log_context(job_id=job_id, institution=linked_item.institution_name)
+        item_listed_before = summary.listed
+        item_downloaded_before = summary.downloaded
+        item_skipped_existing_before = summary.skipped_existing
+        item_skipped_filtered_before = summary.skipped_filtered
+        item_errors_before = summary.errors
+
         logger.info(
             "Listing statements for item_id=%s institution=%s",
             linked_item.item_id,
@@ -277,7 +338,36 @@ def sync_statements(
         )
         account_aliases = {account.account_id: account.alias for account in linked_item.accounts}
         pace_plaid_requests()
-        response = client.list_statements(linked_item.access_token)
+        try:
+            response = client.list_statements(linked_item.access_token)
+        except PlaidAPIError as exc:
+            summary.errors += 1
+            _, reauth_required = _plaid_error_code(exc)
+            _note_item_plaid_error(
+                settings,
+                linked_item,
+                exc,
+                event_callback,
+                event_type="item_login_required" if reauth_required else "item_list_failed",
+                message=(
+                    "Institution requires reauthentication before statements can sync"
+                    if reauth_required
+                    else "Failed to list statements for institution"
+                ),
+            )
+            logger.error(
+                "Listing statements failed item_id=%s institution=%s reauth_required=%s: %s",
+                linked_item.item_id,
+                linked_item.institution_name,
+                reauth_required,
+                exc,
+            )
+            # Move on to the next linked item instead of aborting the whole sync job:
+            # one institution needing reauth shouldn't block every other item's statements.
+            continue
+        else:
+            if linked_item.login_required:
+                set_item_login_required(settings, linked_item.item_id, required=False)
 
         institution_name = response.get("institution_name") or linked_item.institution_name
         accounts = response.get("accounts") or []
@@ -474,8 +564,11 @@ def sync_statements(
                         statement_id,
                         pace_callback=pace_plaid_requests,
                     )
-                except PlaidAPIError:
+                except PlaidAPIError as exc:
                     summary.errors += 1
+                    _, reauth_required = _plaid_error_code(exc)
+                    if reauth_required:
+                        set_item_login_required(settings, linked_item.item_id, required=True)
                     logger.exception(
                         "Failed downloading statement statement_id=%s account_id=%s",
                         statement_id,
@@ -490,6 +583,7 @@ def sync_statements(
                                 "statement_id": statement_id,
                                 "statement_date": statement_date.isoformat(),
                                 "file_name": output_path.name,
+                                "reauth_required": reauth_required,
                             },
                         )
                     if progress_callback:
@@ -557,6 +651,19 @@ def sync_statements(
                 if progress_callback:
                     progress_callback(summary)
 
+        logger.info(
+            "Finished item_id=%s institution=%s: listed=%s downloaded=%s skipped_existing=%s "
+            "skipped_filtered=%s errors=%s",
+            linked_item.item_id,
+            linked_item.institution_name,
+            summary.listed - item_listed_before,
+            summary.downloaded - item_downloaded_before,
+            summary.skipped_existing - item_skipped_existing_before,
+            summary.skipped_filtered - item_skipped_filtered_before,
+            summary.errors - item_errors_before,
+        )
+
+    set_log_context(job_id=job_id)
     if not dry_run:
         save_state(settings, state)
 
@@ -564,7 +671,9 @@ def sync_statements(
         progress_callback(summary)
 
     logger.info(
-        "Sync completed listed=%s downloaded=%s skipped_existing=%s skipped_filtered=%s errors=%s",
+        "Sync completed job_id=%s listed=%s downloaded=%s skipped_existing=%s "
+        "skipped_filtered=%s errors=%s",
+        job_id,
         summary.listed,
         summary.downloaded,
         summary.skipped_existing,
