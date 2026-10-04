@@ -12,3 +12,6 @@ data:
   PSF_RETRY_MAX_ATTEMPTS: "5"
   PSF_RETRY_BASE_DELAY_SECONDS: "1"
   PSF_RETRY_MAX_DELAY_SECONDS: "30"
+  YODLEE_API_URL: https://production.api.yodlee.com/ysl
+  YODLEE_FASTLINK_URL: https://fl4.prod.yodlee.com/authenticate/restserver/fastlink
+  YODLEE_FASTLINK_CONFIG_NAME: Aggregation

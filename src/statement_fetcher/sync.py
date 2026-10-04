@@ -8,13 +8,16 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, timedelta
+from functools import partial
 from pathlib import Path
 
 from .logging_utils import set_log_context
 from .models import DownloadedStatement, LinkedItem
-from .plaid_api import PlaidAPIError, PlaidClient
+from .plaid_api import PlaidClient
+from .provider_errors import ProviderAPIError
 from .settings import Settings
 from .storage import load_configuration, load_state, save_state, set_item_login_required
+from .yodlee_api import YodleeClient
 
 logger = logging.getLogger(__name__)
 
@@ -106,8 +109,7 @@ def _build_output_path(
 
 def _retry_download(
     settings: Settings,
-    plaid_client: PlaidClient,
-    access_token: str,
+    download_call: Callable[[], tuple[bytes, str | None]],
     statement_id: str,
     pace_callback: Callable[[], None] | None = None,
 ) -> tuple[bytes, str | None]:
@@ -122,8 +124,8 @@ def _retry_download(
                 statement_id,
                 attempt,
             )
-            return plaid_client.download_statement(access_token, statement_id)
-        except PlaidAPIError as exc:
+            return download_call()
+        except ProviderAPIError as exc:
             should_retry = exc.retriable and attempt < settings.retry_max_attempts
             if not should_retry:
                 logger.error(
@@ -147,26 +149,32 @@ def _retry_download(
             time.sleep(delay + jitter)
 
 
-def _plaid_error_code(exc: PlaidAPIError) -> tuple[str | None, bool]:
-    """Return (error_code, reauth_required) for a Plaid error."""
+def _provider_error_code(exc: ProviderAPIError) -> tuple[str | None, bool]:
+    """Return (error_code, reauth_required) for a provider error.
+
+    Yodlee's reauth-required error code(s) aren't documented publicly, so only
+    Plaid's ITEM_LOGIN_REQUIRED is recognized for now; a Yodlee login failure
+    surfaces as a plain error until its real code is identified from a live
+    response and added here.
+    """
     error_code = (exc.details or {}).get("error_code")
     return error_code, error_code == "ITEM_LOGIN_REQUIRED"
 
 
-def _note_item_plaid_error(
+def _note_item_provider_error(
     settings: Settings,
     linked_item: LinkedItem,
-    exc: PlaidAPIError,
+    exc: ProviderAPIError,
     event_callback: Callable[[str, str, dict[str, str | int] | None], None] | None,
     *,
     event_type: str,
     message: str,
 ) -> bool:
-    """Record a Plaid failure against a linked item, flagging ITEM_LOGIN_REQUIRED so the
-    UI can surface it and the next successful call against the item clears it again.
+    """Record a provider failure against a linked item, flagging ITEM_LOGIN_REQUIRED so
+    the UI can surface it and the next successful call against the item clears it again.
     Returns whether the item needs reauthentication.
     """
-    error_code, reauth_required = _plaid_error_code(exc)
+    error_code, reauth_required = _provider_error_code(exc)
     if reauth_required:
         set_item_login_required(settings, linked_item.item_id, required=True)
     if event_callback:
@@ -187,6 +195,7 @@ def refresh_statements(
     settings: Settings,
     *,
     plaid_client: PlaidClient | None = None,
+    yodlee_client: YodleeClient | None = None,
     progress_callback: Callable[[RefreshSummary], None] | None = None,
     event_callback: Callable[[str, str, dict[str, str | int] | None], None] | None = None,
     job_id: str | None = None,
@@ -203,7 +212,8 @@ def refresh_statements(
     set_log_context(job_id=job_id)
     logger.info("Statement refresh started job_id=%s", job_id)
     summary = RefreshSummary()
-    client = plaid_client or PlaidClient(settings)
+    plaid = plaid_client or PlaidClient(settings)
+    yodlee = yodlee_client or YodleeClient(settings)
     pace_plaid_requests = _make_pacer(settings)
 
     config = load_configuration(settings)
@@ -235,13 +245,17 @@ def refresh_statements(
             )
             continue
 
-        pace_plaid_requests()
-        try:
-            request_id = client.refresh_statements(
-                linked_item.access_token,
-                refresh_start,
-                refresh_end,
+        if linked_item.provider == "yodlee":
+            request_id_call: Callable[[], str | None] = partial(
+                yodlee.refresh_statements_for_item, linked_item, refresh_start, refresh_end
             )
+        else:
+            pace_plaid_requests()
+            request_id_call = partial(
+                plaid.refresh_statements, linked_item.access_token, refresh_start, refresh_end
+            )
+        try:
+            request_id = request_id_call()
             logger.info(
                 "Requested statement refresh item_id=%s start=%s end=%s request_id=%s",
                 linked_item.item_id,
@@ -253,7 +267,7 @@ def refresh_statements(
             if event_callback:
                 event_callback(
                     "statement_refresh_requested",
-                    "Requested Plaid check for newly posted statements",
+                    "Requested provider check for newly posted statements",
                     {
                         "item_id": linked_item.item_id,
                         "institution_name": linked_item.institution_name,
@@ -261,7 +275,7 @@ def refresh_statements(
                         "end_date": refresh_end.isoformat(),
                     },
                 )
-        except PlaidAPIError as exc:
+        except ProviderAPIError as exc:
             # Best-effort: some items/institutions may not support refresh. A failure
             # here just means /statements/list won't show anything new for this item
             # until the next attempt.
@@ -271,13 +285,13 @@ def refresh_statements(
                 linked_item.item_id,
                 exc,
             )
-            _note_item_plaid_error(
+            _note_item_provider_error(
                 settings,
                 linked_item,
                 exc,
                 event_callback,
                 event_type="statement_refresh_failed",
-                message="Requesting a statement refresh from Plaid failed",
+                message="Requesting a statement refresh failed",
             )
         if progress_callback:
             progress_callback(summary)
@@ -296,6 +310,7 @@ def sync_statements(
     settings: Settings,
     *,
     plaid_client: PlaidClient | None = None,
+    yodlee_client: YodleeClient | None = None,
     dry_run: bool = False,
     since: date | None = None,
     account_id: str | None = None,
@@ -314,7 +329,8 @@ def sync_statements(
         max_downloads,
     )
     summary = SyncSummary()
-    client = plaid_client or PlaidClient(settings)
+    plaid = plaid_client or PlaidClient(settings)
+    yodlee = yodlee_client or YodleeClient(settings)
 
     config = load_configuration(settings)
     state = load_state(settings)
@@ -337,13 +353,16 @@ def sync_statements(
             linked_item.institution_name,
         )
         account_aliases = {account.account_id: account.alias for account in linked_item.accounts}
-        pace_plaid_requests()
         try:
-            response = client.list_statements(linked_item.access_token)
-        except PlaidAPIError as exc:
+            if linked_item.provider == "yodlee":
+                response = yodlee.list_statements_for_item(linked_item)
+            else:
+                pace_plaid_requests()
+                response = plaid.list_statements(linked_item.access_token)
+        except ProviderAPIError as exc:
             summary.errors += 1
-            _, reauth_required = _plaid_error_code(exc)
-            _note_item_plaid_error(
+            _, reauth_required = _provider_error_code(exc)
+            _note_item_provider_error(
                 settings,
                 linked_item,
                 exc,
@@ -556,17 +575,27 @@ def sync_statements(
                         progress_callback(summary)
                     continue
 
+                if linked_item.provider == "yodlee":
+                    download_call: Callable[[], tuple[bytes, str | None]] = partial(
+                        yodlee.download_statement_for_item, linked_item, statement_id
+                    )
+                    download_pace_callback = None
+                else:
+                    download_call = partial(
+                        plaid.download_statement, linked_item.access_token, statement_id
+                    )
+                    download_pace_callback = pace_plaid_requests
+
                 try:
                     pdf_bytes, plaid_hash = _retry_download(
                         settings,
-                        client,
-                        linked_item.access_token,
+                        download_call,
                         statement_id,
-                        pace_callback=pace_plaid_requests,
+                        pace_callback=download_pace_callback,
                     )
-                except PlaidAPIError as exc:
+                except ProviderAPIError as exc:
                     summary.errors += 1
-                    _, reauth_required = _plaid_error_code(exc)
+                    _, reauth_required = _provider_error_code(exc)
                     if reauth_required:
                         set_item_login_required(settings, linked_item.item_id, required=True)
                     logger.exception(

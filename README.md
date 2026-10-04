@@ -1,6 +1,6 @@
-# Plaid Statement Fetcher
+# Statement Fetcher
 
-Statement Fetcher is a split web application for linking accounts with Plaid and downloading statement PDFs.
+Statement Fetcher is a split web application for linking accounts with Plaid or Yodlee and downloading statement PDFs. Each linked institution records which provider it was linked through; sync/refresh dispatches to the right provider per institution automatically.
 
 - Backend: FastAPI + SQLite state store
 - Frontend: React SPA (Material UI)
@@ -14,8 +14,9 @@ Statement Fetcher is a split web application for linking accounts with Plaid and
   - Calls backend over relative `/api` routes
 - Backend service:
   - Plaid link token creation + exchange
+  - Yodlee FastLink session creation + link completion
   - Linked account and alias management
-  - Statement sync orchestration + detailed event logs
+  - Statement sync orchestration + detailed event logs, dispatched per linked item's provider
   - Runtime service configuration persistence
 
 State is stored in `config/state.db` (SQLite) and PDFs in `config/output`.
@@ -75,6 +76,39 @@ Notes:
 - `PLAID_ENV` is a mode flag only; state path does not branch by env.
 - `PSF_ENCRYPTION_SECRET` enables encryption at rest for sensitive persisted values.
 - Service configuration page can override selected non-secret settings at runtime.
+
+### Yodlee (optional second provider)
+
+Required:
+- `YODLEE_CLIENT_ID`
+- `YODLEE_SECRET`
+- `YODLEE_LOGIN_NAME` — the Yodlee end-user loginName whose linked institutions this
+  app manages. In sandbox, use one of the 5 pre-provisioned test users shown under
+  "View Test Users" on the Yodlee developer dashboard (e.g. `sbMem...1`). There is no
+  self-service way to create this loginName via the API in sandbox; in production it's
+  a loginName you provision for yourself through Yodlee's user-provisioning flow.
+
+Core settings:
+- `YODLEE_API_URL` — e.g. `https://sandbox.api.yodlee.com/ysl` (sandbox) or your
+  production base URL.
+- `YODLEE_FASTLINK_URL` — the FastLink launch URL for the same environment.
+- `YODLEE_FASTLINK_CONFIG_NAME` — defaults to `Aggregation`; set from the FastLink
+  Configuration Tool in your Yodlee dashboard if you use a different config.
+
+Known limitations, worth reading before relying on this integration:
+- Yodlee's Documents API (`/documents/search`, `/documents/{id}`) has no publicly
+  documented date field for a statement. `extract_document_date` in `yodlee_api.py`
+  tries several plausible field names and a date embedded in the filename, falling
+  back to today's date (and logging a warning) if none match. If you see statements
+  dated "today" in bulk, the real field name needs to be identified from a live
+  response and added there.
+- Yodlee's sandbox test institution ("Dag Site") has account/balance test data but no
+  document/eStatement test data, so the statement list/download path can only be
+  verified end-to-end against a real linked bank, not sandbox.
+- Reauthentication detection (Plaid's `ITEM_LOGIN_REQUIRED` equivalent) isn't
+  implemented for Yodlee yet, since its error code for a failed/expired login isn't
+  confirmed. A Yodlee login failure currently surfaces as a generic sync error rather
+  than the "Reconnect" UI treatment Plaid items get.
 
 ## Local Development
 
@@ -216,7 +250,8 @@ This triggers the `Release` workflow.
 ## Using the Service
 
 1. Open frontend URL.
-2. Link institution from Home page.
+2. Link an institution from the Home page via either "Link via Plaid" or "Link via
+   Yodlee" — each linked institution remembers which provider it used.
 3. Manage aliases or remove accounts on Account Details page.
 4. Start sync from Sync page and watch logs.
 5. Adjust non-secret runtime options in Service Configuration page.

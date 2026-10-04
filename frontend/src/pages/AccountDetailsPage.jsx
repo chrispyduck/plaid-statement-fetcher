@@ -21,8 +21,12 @@ import DeleteIcon from '@mui/icons-material/Delete';
 import LinkIcon from '@mui/icons-material/Link';
 import SaveIcon from '@mui/icons-material/Save';
 import SyncIcon from '@mui/icons-material/Sync';
-import { fetchJson, reconnectLinkedItem } from '../api';
+import { fetchJson, reconnectLinkedItem, reconnectYodleeItem } from '../api';
 import EventLogTable from '../components/EventLogTable';
+
+function providerLabel(provider) {
+  return provider === 'yodlee' ? 'Yodlee' : 'Plaid';
+}
 
 function AccountDetailsPage() {
   const { accountId } = useParams();
@@ -112,15 +116,22 @@ function AccountDetailsPage() {
 
   const reconnectAccount = async () => {
     setIsReconnecting(true);
-    setStatusMessage('Opening Plaid to reconnect...');
+    setStatusMessage(`Opening ${providerLabel(details.provider)} to reconnect...`);
     setErrorMessage('');
 
     try {
-      const result = await reconnectLinkedItem({
-        itemId: details.item_id,
-        accountId,
-        onStatus: setStatusMessage,
-      });
+      const result =
+        details.provider === 'yodlee'
+          ? await reconnectYodleeItem({
+              providerAccountId: details.item_id,
+              accountId,
+              onStatus: setStatusMessage,
+            })
+          : await reconnectLinkedItem({
+              itemId: details.item_id,
+              accountId,
+              onStatus: setStatusMessage,
+            });
       if (result.cancelled) {
         setStatusMessage('');
       } else {
@@ -239,6 +250,10 @@ function AccountDetailsPage() {
               </Button>
             </Stack>
 
+            <Box>
+              <Typography variant="subtitle2" color="text.secondary">Provider</Typography>
+              <Typography>{providerLabel(details.provider)}</Typography>
+            </Box>
             <Box>
               <Typography variant="subtitle2" color="text.secondary">Institution</Typography>
               <Typography>{details.institution_name}</Typography>

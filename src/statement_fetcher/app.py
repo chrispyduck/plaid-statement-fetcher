@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 from .logging_utils import ContextualFormatter, set_log_context
 from .models import LinkedAccount, LinkedItem
 from .plaid_api import PlaidAPIError, PlaidClient
+from .provider_errors import ProviderAPIError
 from .settings import Settings
 from .storage import (
     add_event,
@@ -49,6 +50,7 @@ from .storage import (
     list_sync_jobs as list_persisted_sync_jobs,
 )
 from .sync import RefreshSummary, SyncSummary, refresh_statements, sync_statements
+from .yodlee_api import YodleeAPIError, YodleeClient
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +74,10 @@ class LinkTokenRequest(BaseModel):
 
 class LinkExchangeRequest(BaseModel):
     public_token: str
+
+
+class YodleeLinkCompleteRequest(BaseModel):
+    provider_account_id: str
 
 
 class SyncStartRequest(BaseModel):
@@ -111,10 +117,16 @@ class ServiceConfigUpdateRequest(BaseModel):
 
 
 class AppContext:
-    def __init__(self, settings: Settings, plaid_client: PlaidClient | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        plaid_client: PlaidClient | None = None,
+        yodlee_client: YodleeClient | None = None,
+    ) -> None:
         self.settings = settings
         self.settings.load_credentials_fallback()
         self.plaid = plaid_client or PlaidClient(self.settings)
+        self.yodlee = yodlee_client or YodleeClient(self.settings)
         self.default_service_config: dict[str, ServiceSettingValue] = {
             "plaid_language": self.settings.plaid_language,
             "plaid_country_codes": self.settings.plaid_country_codes,
@@ -183,6 +195,14 @@ def _plaid_http_exception(exc: PlaidAPIError) -> HTTPException:
     return HTTPException(status_code=400, detail=payload)
 
 
+def _provider_http_exception(exc: ProviderAPIError) -> HTTPException:
+    if isinstance(exc, YodleeAPIError):
+        return _yodlee_http_exception(exc)
+    if isinstance(exc, PlaidAPIError):
+        return _plaid_http_exception(exc)
+    return HTTPException(status_code=400, detail={"message": str(exc)})
+
+
 def _map_plaid_accounts(accounts: list[dict[str, Any]]) -> list[LinkedAccount]:
     mapped: list[LinkedAccount] = []
     for account in accounts:
@@ -198,6 +218,34 @@ def _map_plaid_accounts(accounts: list[dict[str, Any]]) -> list[LinkedAccount]:
             )
         )
     return mapped
+
+
+def _map_yodlee_accounts(accounts: list[dict[str, Any]]) -> list[LinkedAccount]:
+    mapped: list[LinkedAccount] = []
+    for account in accounts:
+        account_number = str(account.get("accountNumber") or "")
+        mapped.append(
+            LinkedAccount(
+                account_id=str(account["id"]),
+                account_name=account.get("accountName") or "Unnamed Account",
+                account_mask=account_number[-4:] if account_number else None,
+                account_type=account.get("accountType"),
+                account_subtype=account.get("CONTAINER"),
+            )
+        )
+    return mapped
+
+
+def _yodlee_http_exception(exc: YodleeAPIError) -> HTTPException:
+    details = exc.details or {}
+    message = details.get("errorMessage") or str(exc)
+    payload: dict[str, str | int | bool | None] = {
+        "message": message,
+        "status_code": exc.status_code,
+        "retriable": exc.retriable,
+        "error_code": details.get("errorCode"),
+    }
+    return HTTPException(status_code=400, detail=payload)
 
 
 def scheduler_tick(
@@ -248,6 +296,7 @@ def scheduler_tick(
 def create_app(
     settings: Settings | None = None,
     plaid_client: PlaidClient | None = None,
+    yodlee_client: YodleeClient | None = None,
     *,
     enable_scheduler: bool = False,
 ) -> FastAPI:
@@ -259,7 +308,7 @@ def create_app(
         logging.basicConfig(level=logging.INFO, handlers=[handler])
 
     resolved_settings = settings or Settings()
-    ctx = AppContext(resolved_settings, plaid_client=plaid_client)
+    ctx = AppContext(resolved_settings, plaid_client=plaid_client, yodlee_client=yodlee_client)
     _apply_service_overrides(ctx)
     logger.info("App startup env=%s", ctx.settings.plaid_env)
 
@@ -293,16 +342,26 @@ def create_app(
         set_log_context(item_id=linked_item.item_id, institution=linked_item.institution_name)
         try:
             logger.info(
-                "Refreshing linked item item_id=%s institution=%s",
+                "Refreshing linked item item_id=%s institution=%s provider=%s",
                 linked_item.item_id,
                 linked_item.institution_name,
+                linked_item.provider,
             )
             try:
-                accounts, institution_id = ctx.plaid.get_accounts(linked_item.access_token)
-                resolved_id, institution_name, institution_logo = ctx.plaid.get_institution_name(
-                    institution_id or linked_item.institution_id,
-                )
-            except PlaidAPIError as exc:
+                if linked_item.provider == "yodlee":
+                    accounts, resolved_id, institution_name, institution_logo = (
+                        ctx.yodlee.get_accounts_for_provider_account(linked_item.item_id)
+                    )
+                    mapped_accounts = _map_yodlee_accounts(accounts)
+                else:
+                    plaid_accounts, institution_id = ctx.plaid.get_accounts(
+                        linked_item.access_token
+                    )
+                    resolved_id, institution_name, institution_logo = (
+                        ctx.plaid.get_institution_name(institution_id or linked_item.institution_id)
+                    )
+                    mapped_accounts = _map_plaid_accounts(plaid_accounts)
+            except (PlaidAPIError, YodleeAPIError) as exc:
                 details = exc.details or {}
                 reauth_required = details.get("error_code") == "ITEM_LOGIN_REQUIRED"
                 logger.error(
@@ -329,12 +388,13 @@ def create_app(
                     )
                 raise
             refreshed_item = LinkedItem(
+                provider=linked_item.provider,
                 institution_id=resolved_id,
                 institution_name=institution_name,
                 institution_logo=institution_logo,
                 item_id=linked_item.item_id,
                 access_token=linked_item.access_token,
-                accounts=_map_plaid_accounts(accounts),
+                accounts=mapped_accounts,
             )
             upsert_linked_item(ctx.settings, refreshed_item)
             logger.info(
@@ -389,6 +449,7 @@ def create_app(
             for account in item.accounts:
                 rows.append(
                     {
+                        "provider": item.provider,
                         "institution_id": item.institution_id,
                         "institution_name": item.institution_name,
                         "institution_logo": item.institution_logo,
@@ -415,10 +476,10 @@ def create_app(
         for linked_item in config.linked_items:
             try:
                 results.append(refresh_linked_item(linked_item))
-            except PlaidAPIError as exc:
+            except ProviderAPIError as exc:
                 logger.exception("Refresh failed for item_id=%s", linked_item.item_id)
                 details = exc.details or {}
-                message = str(details.get("error_message") or str(exc))
+                message = str(details.get("error_message") or details.get("errorMessage") or exc)
                 failed.append({"item_id": linked_item.item_id, "error": message})
 
         status = "refreshed"
@@ -451,9 +512,9 @@ def create_app(
 
         try:
             refreshed = refresh_linked_item(linked_item)
-        except PlaidAPIError as exc:
+        except ProviderAPIError as exc:
             logger.exception("Refresh failed for account_id=%s", account_id)
-            raise _plaid_http_exception(exc) from exc
+            raise _provider_http_exception(exc) from exc
 
         return {
             "status": "refreshed",
@@ -600,6 +661,55 @@ def create_app(
             "accounts_count": len(linked_item.accounts),
         }
 
+    @app.post("/api/yodlee/fastlink/session")
+    def create_yodlee_fastlink_session() -> dict[str, str]:
+        logger.info("Create Yodlee FastLink session requested")
+        try:
+            session = ctx.yodlee.create_fastlink_session()
+        except YodleeAPIError as exc:
+            logger.exception("Create Yodlee FastLink session failed")
+            raise _yodlee_http_exception(exc) from exc
+        return session
+
+    @app.post("/api/yodlee/link/complete")
+    def complete_yodlee_link(payload: YodleeLinkCompleteRequest) -> dict[str, str | int]:
+        logger.info(
+            "Completing Yodlee link provider_account_id=%s",
+            payload.provider_account_id,
+        )
+        try:
+            accounts, provider_id, provider_name, provider_logo = (
+                ctx.yodlee.get_accounts_for_provider_account(payload.provider_account_id)
+            )
+        except YodleeAPIError as exc:
+            logger.exception("Completing Yodlee link failed")
+            raise _yodlee_http_exception(exc) from exc
+
+        if not ctx.settings.yodlee_login_name:
+            raise HTTPException(status_code=500, detail="Yodlee login name is not configured")
+
+        linked_item = LinkedItem(
+            provider="yodlee",
+            institution_id=provider_id,
+            institution_name=provider_name,
+            institution_logo=provider_logo,
+            item_id=payload.provider_account_id,
+            access_token=ctx.settings.yodlee_login_name,
+            accounts=_map_yodlee_accounts(accounts),
+        )
+        upsert_linked_item(ctx.settings, linked_item)
+        logger.info(
+            "Linked Yodlee item stored item_id=%s institution=%s accounts=%s",
+            linked_item.item_id,
+            provider_name,
+            len(linked_item.accounts),
+        )
+        return {
+            "status": "linked",
+            "item_id": linked_item.item_id,
+            "accounts_count": len(linked_item.accounts),
+        }
+
     def _launch_sync_job(payload: SyncStartRequest, *, trigger: str = "manual") -> str:
         job_id = str(uuid4())
         started_at = datetime.now(UTC).isoformat()
@@ -647,6 +757,7 @@ def create_app(
                 summary = sync_statements(
                     ctx.settings,
                     plaid_client=ctx.plaid,
+                    yodlee_client=ctx.yodlee,
                     job_id=job_id,
                     dry_run=payload.dry_run,
                     since=since_date,
@@ -757,6 +868,7 @@ def create_app(
                 summary = refresh_statements(
                     ctx.settings,
                     plaid_client=ctx.plaid,
+                    yodlee_client=ctx.yodlee,
                     job_id=job_id,
                     progress_callback=on_progress,
                     event_callback=lambda event_type, message, metadata: add_event(

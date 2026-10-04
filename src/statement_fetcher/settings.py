@@ -33,6 +33,13 @@ class Settings(BaseSettings):
     statements_start_date: date | None = Field(default=None, alias="PSF_STATEMENTS_START_DATE")
     statements_end_date: date | None = Field(default=None, alias="PSF_STATEMENTS_END_DATE")
 
+    yodlee_client_id: str | None = None
+    yodlee_secret: str | None = None
+    yodlee_login_name: str | None = None
+    yodlee_api_url: str = "https://sandbox.api.yodlee.com/ysl"
+    yodlee_fastlink_url: str = "https://fl4.sandbox.yodlee.com/authenticate/restserver/fastlink"
+    yodlee_fastlink_config_name: str = "Aggregation"
+
     @property
     def env_root(self) -> Path:
         return self.config_root

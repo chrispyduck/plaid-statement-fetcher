@@ -72,6 +72,77 @@ def test_plaintext_access_token_compatibility_without_secret(tmp_path) -> None:
     assert config.linked_items[0].access_token == "access-plain"
 
 
+def test_provider_defaults_to_plaid_and_round_trips(tmp_path) -> None:
+    settings = Settings(plaid_env="sandbox", PSF_CONFIG_ROOT=tmp_path)
+
+    upsert_linked_item(
+        settings,
+        LinkedItem(
+            institution_id="ins_1",
+            institution_name="Bank A",
+            item_id="item_1",
+            access_token="token_1",
+            accounts=[LinkedAccount(account_id="acc_1", account_name="Checking")],
+        ),
+    )
+    upsert_linked_item(
+        settings,
+        LinkedItem(
+            provider="yodlee",
+            institution_id="16445",
+            institution_name="Dag Site",
+            item_id="provacc_1",
+            access_token="sbMem1",
+            accounts=[LinkedAccount(account_id="acc_2", account_name="Savings")],
+        ),
+    )
+
+    config = load_configuration(settings)
+    providers = {item.item_id: item.provider for item in config.linked_items}
+    assert providers == {"item_1": "plaid", "provacc_1": "yodlee"}
+
+
+def test_migrates_pre_provider_column_linked_items_table(tmp_path) -> None:
+    # Regression test: a database created before the provider column existed must
+    # upgrade cleanly and treat every pre-existing row as a Plaid item.
+    settings = Settings(plaid_env="sandbox", PSF_CONFIG_ROOT=tmp_path)
+    db_path = tmp_path / "state.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE linked_items (
+                item_id TEXT PRIMARY KEY,
+                institution_id TEXT NOT NULL,
+                institution_name TEXT NOT NULL,
+                institution_logo TEXT,
+                access_token TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                login_required INTEGER NOT NULL DEFAULT 0,
+                login_required_at TEXT
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO linked_items (
+                item_id, institution_id, institution_name, access_token,
+                created_at, updated_at
+            ) VALUES ('item_old', 'ins_1', 'Bank A', 'token', '2026-01-01T00:00:00+00:00',
+                '2026-01-01T00:00:00+00:00')
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    config = load_configuration(settings)  # must not raise
+    assert config.linked_items[0].provider == "plaid"
+
+
 def test_upsert_linked_item_preserves_existing_alias(tmp_path) -> None:
     settings = Settings(plaid_env="sandbox", PSF_CONFIG_ROOT=tmp_path)
 

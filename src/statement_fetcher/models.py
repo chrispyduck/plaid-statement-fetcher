@@ -6,6 +6,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 Environment = Literal["sandbox", "production"]
+Provider = Literal["plaid", "yodlee"]
 
 
 class LinkedAccount(BaseModel):
@@ -18,10 +19,14 @@ class LinkedAccount(BaseModel):
 
 
 class LinkedItem(BaseModel):
+    provider: Provider = "plaid"
     institution_id: str
     institution_name: str
     institution_logo: str | None = None
     item_id: str
+    # For Plaid this is the real item access_token. Yodlee has no equivalent
+    # long-lived per-item token, so this holds the Yodlee loginName instead, used to
+    # mint short-lived session tokens on demand; it's encrypted at rest either way.
     access_token: str
     accounts: list[LinkedAccount] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))

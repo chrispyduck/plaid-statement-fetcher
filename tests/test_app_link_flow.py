@@ -19,6 +19,34 @@ from statement_fetcher.storage import (
 )
 
 
+class FakeYodleeClient:
+    def create_fastlink_session(self) -> dict[str, str]:
+        return {
+            "access_token": "yodlee-token",
+            "fastlink_url": "https://fl4.sandbox.yodlee.com/authenticate/restserver/fastlink",
+            "config_name": "Aggregation",
+        }
+
+    def get_accounts_for_provider_account(
+        self, provider_account_id: str
+    ) -> tuple[list[dict[str, str]], str, str, str | None]:
+        assert provider_account_id == "provacc_1"
+        return (
+            [
+                {
+                    "id": 12565108,
+                    "accountName": "Joint Checking",
+                    "accountNumber": "xxxx9060",
+                    "accountType": "CHECKING",
+                    "CONTAINER": "bank",
+                }
+            ],
+            "16445",
+            "Dag Site TokenFMPA",
+            "https://cdn.yodlee.com/LOGO/LOGO_16445_1_2.SVG",
+        )
+
+
 class FakePlaidClient:
     def create_link_token(self, origin: str | None) -> str:
         assert origin == "https://statement-fetcher.localhost"
@@ -85,6 +113,36 @@ def test_link_token_and_exchange_persists_accounts(tmp_path) -> None:
         assert payload[0]["institution_name"] == "Chase"
         assert payload[0]["institution_logo"] == "ZmFrZS1sb2dv"
         assert payload[0]["account_name"] == "Everyday Checking"
+
+    run_with_client(app, test_body)
+
+
+def test_yodlee_fastlink_session_and_link_complete(tmp_path) -> None:
+    settings = Settings(plaid_env="sandbox", PSF_CONFIG_ROOT=tmp_path, yodlee_login_name="sbMem1")
+    app = create_app(
+        settings=settings,
+        plaid_client=FakePlaidClient(),
+        yodlee_client=FakeYodleeClient(),
+    )
+
+    async def test_body(client: httpx.AsyncClient) -> None:
+        session_response = await client.post("/api/yodlee/fastlink/session")
+        assert session_response.status_code == 200
+        assert session_response.json()["access_token"] == "yodlee-token"
+
+        complete_response = await client.post(
+            "/api/yodlee/link/complete",
+            json={"provider_account_id": "provacc_1"},
+        )
+        assert complete_response.status_code == 200
+        assert complete_response.json()["accounts_count"] == 1
+
+        accounts_response = await client.get("/api/accounts")
+        rows = accounts_response.json()
+        assert len(rows) == 1
+        assert rows[0]["provider"] == "yodlee"
+        assert rows[0]["institution_name"] == "Dag Site TokenFMPA"
+        assert rows[0]["account_id"] == "12565108"
 
     run_with_client(app, test_body)
 

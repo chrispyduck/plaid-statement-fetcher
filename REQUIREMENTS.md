@@ -3,8 +3,10 @@
 ## Product Scope
 
 Build a production-ready web application that:
-- links institutions/accounts via Plaid Link,
-- syncs and downloads account statements,
+- links institutions/accounts via Plaid Link or Yodlee FastLink, recording which
+  provider each linked institution uses,
+- syncs and downloads account statements from whichever provider an institution was
+  linked through,
 - persists service state locally,
 - supports deployment as split frontend/backend services.
 

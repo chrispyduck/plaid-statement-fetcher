@@ -195,7 +195,7 @@ function SyncProgressPage() {
       if (nextJobId) {
         setSelectedJobId(nextJobId);
       }
-      showToast('Refresh started. Newly-posted statements usually take a while to show up in Plaid — run a fetch after it completes.');
+      showToast('Refresh started. Newly-posted statements usually take a while to show up with your provider — run a fetch after it completes.');
       await loadJobs({ preferredJobId: nextJobId });
       await loadJobsSummary();
     } catch (error) {
@@ -219,11 +219,11 @@ function SyncProgressPage() {
           <Stack spacing={2}>
             <Typography variant="h5">Statement Download Progress</Typography>
             <Typography variant="body2" color="text.secondary">
-              Refresh asks Plaid to check your institutions for newly-posted statements; fetch
-              lists and downloads whatever Plaid currently has. They run on independent
-              schedules — by default, refresh weekly and fetch ~24h after each refresh
-              completes — since Plaid needs time to process a refresh before new
-              statements show up.
+              Refresh asks each institution's provider (Plaid or Yodlee) to check for
+              newly-posted statements; fetch lists and downloads whatever the provider
+              currently has. They run on independent schedules — by default, refresh
+              weekly and fetch ~24h after each refresh completes — since providers need
+              time to process a refresh before new statements show up.
             </Typography>
             <Grid container spacing={2}>
               <Grid item xs={12} sm={6}>

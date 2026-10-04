@@ -36,6 +36,7 @@ def _initialize_database(path: Path) -> None:
 
             CREATE TABLE IF NOT EXISTS linked_items (
                 item_id TEXT PRIMARY KEY,
+                provider TEXT NOT NULL DEFAULT 'plaid',
                 institution_id TEXT NOT NULL,
                 institution_name TEXT NOT NULL,
                 institution_logo TEXT,
@@ -121,6 +122,10 @@ def _initialize_database(path: Path) -> None:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(linked_items)").fetchall()}
         if "institution_logo" not in columns:
             conn.execute("ALTER TABLE linked_items ADD COLUMN institution_logo TEXT")
+        if "provider" not in columns:
+            conn.execute(
+                "ALTER TABLE linked_items ADD COLUMN provider TEXT NOT NULL DEFAULT 'plaid'"
+            )
         if "login_required" not in columns:
             conn.execute(
                 "ALTER TABLE linked_items ADD COLUMN login_required INTEGER NOT NULL DEFAULT 0"
@@ -154,6 +159,7 @@ def load_configuration(settings: Settings) -> ConfigurationFile:
             """
             SELECT
                 item_id,
+                provider,
                 institution_id,
                 institution_name,
                 institution_logo,
@@ -197,6 +203,7 @@ def load_configuration(settings: Settings) -> ConfigurationFile:
     for row in items_rows:
         linked_items.append(
             LinkedItem(
+                provider=row["provider"],
                 institution_id=row["institution_id"],
                 institution_name=row["institution_name"],
                 institution_logo=row["institution_logo"],
@@ -231,16 +238,18 @@ def save_configuration(settings: Settings, config: ConfigurationFile) -> None:
                 """
                 INSERT INTO linked_items (
                     item_id,
+                    provider,
                     institution_id,
                     institution_name,
                     institution_logo,
                     access_token,
                     created_at,
                     updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item.item_id,
+                    item.provider,
                     item.institution_id,
                     item.institution_name,
                     item.institution_logo,
@@ -418,6 +427,7 @@ def upsert_linked_item(settings: Settings, linked_item: LinkedItem) -> None:
             """
             INSERT INTO linked_items (
                 item_id,
+                provider,
                 institution_id,
                 institution_name,
                 institution_logo,
@@ -426,8 +436,9 @@ def upsert_linked_item(settings: Settings, linked_item: LinkedItem) -> None:
                 updated_at,
                 login_required,
                 login_required_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)
             ON CONFLICT(item_id) DO UPDATE SET
+                provider = excluded.provider,
                 institution_id = excluded.institution_id,
                 institution_name = excluded.institution_name,
                 institution_logo = excluded.institution_logo,
@@ -438,6 +449,7 @@ def upsert_linked_item(settings: Settings, linked_item: LinkedItem) -> None:
             """,
             (
                 linked_item.item_id,
+                linked_item.provider,
                 linked_item.institution_id,
                 linked_item.institution_name,
                 linked_item.institution_logo,
@@ -547,6 +559,7 @@ def get_account_details(settings: Settings, account_id: str) -> dict[str, Any] |
                 la.account_subtype,
                 la.alias,
                 li.item_id,
+                li.provider,
                 li.institution_id,
                 li.institution_name,
                 li.created_at,
@@ -571,6 +584,7 @@ def get_account_details(settings: Settings, account_id: str) -> dict[str, Any] |
         "account_subtype": row["account_subtype"],
         "alias": row["alias"],
         "item_id": row["item_id"],
+        "provider": row["provider"],
         "institution_id": row["institution_id"],
         "institution_name": row["institution_name"],
         "linked_created_at": row["created_at"],

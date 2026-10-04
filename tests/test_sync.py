@@ -7,6 +7,7 @@ from statement_fetcher.plaid_api import PlaidAPIError
 from statement_fetcher.settings import Settings
 from statement_fetcher.storage import load_configuration, load_state, upsert_linked_item
 from statement_fetcher.sync import refresh_statements, sync_statements
+from statement_fetcher.yodlee_api import YodleeAPIError
 
 
 class FakeSyncPlaidClient:
@@ -152,7 +153,9 @@ def test_sync_logs_no_statement_and_unavailable_accounts(tmp_path) -> None:
     assert "account_no_statements" in event_types
     assert "account_statement_unavailable" in event_types
 
-    unavailable = [entry for entry in captured_events if entry[0] == "account_statement_unavailable"]
+    unavailable = [
+        entry for entry in captured_events if entry[0] == "account_statement_unavailable"
+    ]
     assert unavailable[0][2] is not None
     assert unavailable[0][2]["account_id"] == "acc_2"
 
@@ -345,3 +348,143 @@ def test_refresh_statements_handles_failure_per_item(tmp_path) -> None:
     assert summary.failed == 1
     event_types = [event_type for event_type, _message, _metadata in captured_events]
     assert "statement_refresh_failed" in event_types
+
+
+class FakeSyncYodleeClient:
+    def __init__(self) -> None:
+        self.download_calls = 0
+        self.refresh_calls: list[str] = []
+
+    def refresh_statements_for_item(self, linked_item: LinkedItem, start_date, end_date) -> str:
+        assert linked_item.item_id == "provacc_1"
+        self.refresh_calls.append(linked_item.item_id)
+        return "req_yodlee"
+
+    def list_statements_for_item(self, linked_item: LinkedItem) -> dict:
+        assert linked_item.item_id == "provacc_1"
+        return {
+            "institution_name": "Dag Site",
+            "accounts": [
+                {
+                    "account_id": "yacc_1",
+                    "account_name": "Yodlee Checking",
+                    "statements": [
+                        {"statement_id": "doc_1", "date_posted": "2026-06-30"},
+                    ],
+                }
+            ],
+        }
+
+    def download_statement_for_item(
+        self, linked_item: LinkedItem, statement_id: str
+    ) -> tuple[bytes, None]:
+        assert linked_item.item_id == "provacc_1"
+        assert statement_id == "doc_1"
+        self.download_calls += 1
+        return b"%PDF-1.7 fake-yodlee", None
+
+
+def test_sync_handles_plaid_and_yodlee_items_together(tmp_path) -> None:
+    settings = Settings(plaid_env="sandbox", PSF_CONFIG_ROOT=tmp_path)
+
+    upsert_linked_item(
+        settings,
+        LinkedItem(
+            provider="plaid",
+            institution_id="ins_1",
+            institution_name="Chase",
+            item_id="item_1",
+            access_token="access_1",
+            accounts=[LinkedAccount(account_id="acc_1", account_name="Checking")],
+        ),
+    )
+    upsert_linked_item(
+        settings,
+        LinkedItem(
+            provider="yodlee",
+            institution_id="16445",
+            institution_name="Dag Site",
+            item_id="provacc_1",
+            access_token="sbMem1",
+            accounts=[LinkedAccount(account_id="yacc_1", account_name="Checking")],
+        ),
+    )
+
+    plaid_client = FakeSyncPlaidClient()
+    yodlee_client = FakeSyncYodleeClient()
+
+    summary = sync_statements(settings, plaid_client=plaid_client, yodlee_client=yodlee_client)
+
+    assert summary.downloaded == 2
+    assert plaid_client.download_calls == 1
+    assert yodlee_client.download_calls == 1
+
+    config = load_configuration(settings)
+    providers = {item.item_id: item.provider for item in config.linked_items}
+    assert providers == {"item_1": "plaid", "provacc_1": "yodlee"}
+
+
+def test_refresh_statements_dispatches_to_yodlee_client(tmp_path) -> None:
+    settings = Settings(plaid_env="sandbox", PSF_CONFIG_ROOT=tmp_path)
+
+    upsert_linked_item(
+        settings,
+        LinkedItem(
+            provider="yodlee",
+            institution_id="16445",
+            institution_name="Dag Site",
+            item_id="provacc_1",
+            access_token="sbMem1",
+            accounts=[LinkedAccount(account_id="yacc_1", account_name="Checking")],
+        ),
+    )
+
+    yodlee_client = FakeSyncYodleeClient()
+    summary = refresh_statements(settings, yodlee_client=yodlee_client)
+
+    assert summary.requested == 1
+    assert yodlee_client.refresh_calls == ["provacc_1"]
+
+
+class FakeSyncYodleeClientReauthFails:
+    def list_statements_for_item(self, linked_item: LinkedItem) -> dict:
+        raise YodleeAPIError(
+            "Yodlee API request failed",
+            status_code=401,
+            details={"error_code": "ITEM_LOGIN_REQUIRED", "errorCode": "Y999"},
+        )
+
+    def download_statement_for_item(self, linked_item, statement_id):
+        raise AssertionError("no downloads expected")
+
+
+def test_sync_flags_yodlee_item_login_required(tmp_path) -> None:
+    settings = Settings(plaid_env="sandbox", PSF_CONFIG_ROOT=tmp_path)
+
+    upsert_linked_item(
+        settings,
+        LinkedItem(
+            provider="yodlee",
+            institution_id="16445",
+            institution_name="Dag Site",
+            item_id="provacc_1",
+            access_token="sbMem1",
+            accounts=[LinkedAccount(account_id="yacc_1", account_name="Checking")],
+        ),
+    )
+
+    captured_events: list[tuple[str, str, dict[str, str | int] | None]] = []
+    summary = sync_statements(
+        settings,
+        yodlee_client=FakeSyncYodleeClientReauthFails(),
+        event_callback=lambda event_type, message, metadata: captured_events.append(
+            (event_type, message, metadata)
+        ),
+    )
+
+    assert summary.errors == 1
+    event_types = [event_type for event_type, _message, _metadata in captured_events]
+    assert "item_login_required" in event_types
+
+    config = load_configuration(settings)
+    assert config.linked_items[0].login_required is True

@@ -7,24 +7,14 @@ from urllib.parse import urlparse
 
 import httpx
 
+from .provider_errors import ProviderAPIError
 from .settings import Settings
 
 logger = logging.getLogger(__name__)
 
 
-class PlaidAPIError(RuntimeError):
-    def __init__(
-        self,
-        message: str,
-        *,
-        status_code: int | None = None,
-        retriable: bool = False,
-        details: dict[str, Any] | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.status_code = status_code
-        self.retriable = retriable
-        self.details = details or {}
+class PlaidAPIError(ProviderAPIError):
+    pass
 
 
 class PlaidClient:

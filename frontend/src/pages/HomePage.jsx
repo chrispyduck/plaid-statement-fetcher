@@ -21,7 +21,15 @@ import LinkIcon from '@mui/icons-material/Link';
 import VisibilityIcon from '@mui/icons-material/Visibility';
 import SyncIcon from '@mui/icons-material/Sync';
 import WarningAmberIcon from '@mui/icons-material/WarningAmber';
-import { apiBaseUrl, fetchJson, plaidOriginUrl, parseApiError, reconnectLinkedItem } from '../api';
+import {
+  apiBaseUrl,
+  fetchJson,
+  plaidOriginUrl,
+  parseApiError,
+  reconnectLinkedItem,
+  reconnectYodleeItem,
+  startYodleeLink,
+} from '../api';
 
 function institutionPalette(institutionId, institutionName) {
   const source = String(institutionId || institutionName || '?');
@@ -48,10 +56,15 @@ function institutionLogoDataUrl(rawLogo) {
   if (!rawLogo) {
     return '';
   }
-  if (rawLogo.startsWith('data:image/')) {
+  // Plaid returns a base64-encoded logo; Yodlee returns a plain https URL.
+  if (rawLogo.startsWith('data:image/') || rawLogo.startsWith('http')) {
     return rawLogo;
   }
   return `data:image/png;base64,${rawLogo}`;
+}
+
+function providerLabel(provider) {
+  return provider === 'yodlee' ? 'Yodlee' : 'Plaid';
 }
 
 function HomePage() {
@@ -158,17 +171,45 @@ function HomePage() {
     }
   };
 
-  const reconnectRow = async (row) => {
-    setReconnectingAccountId(row.account_id);
-    setStatusMessage('Opening Plaid to reconnect...');
+  const startYodleeLinkFlow = async () => {
+    setIsLinking(true);
     setErrorMessage('');
 
     try {
-      const result = await reconnectLinkedItem({
-        itemId: row.item_id,
-        accountId: row.account_id,
-        onStatus: setStatusMessage,
-      });
+      const result = await startYodleeLink({ onStatus: setStatusMessage });
+      if (result.cancelled) {
+        setStatusMessage('');
+      } else {
+        await fetchAccounts();
+        setStatusMessage('Account linked successfully.');
+      }
+    } catch (error) {
+      console.error('Yodlee link failed', error);
+      setErrorMessage(`Failed to link via Yodlee: ${String(error)}`);
+      setStatusMessage('');
+    } finally {
+      setIsLinking(false);
+    }
+  };
+
+  const reconnectRow = async (row) => {
+    setReconnectingAccountId(row.account_id);
+    setStatusMessage(`Opening ${providerLabel(row.provider)} to reconnect...`);
+    setErrorMessage('');
+
+    try {
+      const result =
+        row.provider === 'yodlee'
+          ? await reconnectYodleeItem({
+              providerAccountId: row.item_id,
+              accountId: row.account_id,
+              onStatus: setStatusMessage,
+            })
+          : await reconnectLinkedItem({
+              itemId: row.item_id,
+              accountId: row.account_id,
+              onStatus: setStatusMessage,
+            });
       if (result.cancelled) {
         setStatusMessage('');
       } else {
@@ -197,7 +238,16 @@ function HomePage() {
                 onClick={startLink}
                 disabled={isLinking}
               >
-                {isLinking ? 'Linking...' : 'Link Institution'}
+                {isLinking ? 'Linking...' : 'Link via Plaid'}
+              </Button>
+              <Button
+                variant="contained"
+                color="secondary"
+                startIcon={isLinking ? <CircularProgress color="inherit" size={18} /> : <LinkIcon />}
+                onClick={startYodleeLinkFlow}
+                disabled={isLinking}
+              >
+                {isLinking ? 'Linking...' : 'Link via Yodlee'}
               </Button>
               <Button
                 variant="outlined"
@@ -231,6 +281,7 @@ function HomePage() {
                 <TableHead>
                   <TableRow>
                     <TableCell>Institution</TableCell>
+                    <TableCell>Provider</TableCell>
                     <TableCell>Account</TableCell>
                     <TableCell>Alias</TableCell>
                     <TableCell>Status</TableCell>
@@ -240,7 +291,7 @@ function HomePage() {
                 <TableBody>
                   {accounts.length === 0 && !isLoadingAccounts ? (
                     <TableRow>
-                      <TableCell colSpan={5}>No linked accounts yet.</TableCell>
+                      <TableCell colSpan={6}>No linked accounts yet.</TableCell>
                     </TableRow>
                   ) : (
                     accounts.map((row) => (
@@ -267,6 +318,9 @@ function HomePage() {
                             </Avatar>
                             <Typography variant="body2">{row.institution_name}</Typography>
                           </Stack>
+                        </TableCell>
+                        <TableCell>
+                          <Chip size="small" label={providerLabel(row.provider)} />
                         </TableCell>
                         <TableCell>{row.account_name}</TableCell>
                         <TableCell>{row.alias || '—'}</TableCell>

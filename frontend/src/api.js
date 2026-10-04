@@ -114,3 +114,150 @@ export async function reconnectLinkedItem({ itemId, accountId, onStatus }) {
     handler.open();
   });
 }
+
+/**
+ * Opens Yodlee FastLink in a full-screen overlay this helper creates and tears down
+ * itself, since FastLink (unlike Plaid Link) renders into a container element the
+ * host page must provide rather than managing its own overlay.
+ */
+function openYodleeFastlink({ session, params, onSuccess, onError, onClose }) {
+  const fastlink = window.fastlink;
+  if (!fastlink) {
+    throw new Error('Yodlee FastLink script not loaded');
+  }
+
+  const overlay = document.createElement('div');
+  overlay.style.position = 'fixed';
+  overlay.style.inset = '0';
+  overlay.style.zIndex = '2000';
+  overlay.style.background = 'rgba(0, 0, 0, 0.5)';
+  overlay.style.display = 'flex';
+  overlay.style.alignItems = 'center';
+  overlay.style.justifyContent = 'center';
+
+  const panel = document.createElement('div');
+  panel.style.background = '#fff';
+  panel.style.borderRadius = '12px';
+  panel.style.width = 'min(480px, 94vw)';
+  panel.style.height = 'min(620px, 90vh)';
+  panel.style.overflow = 'hidden';
+  panel.style.position = 'relative';
+
+  const containerId = `container-fastlink-${Date.now()}`;
+  const container = document.createElement('div');
+  container.id = containerId;
+  container.style.width = '100%';
+  container.style.height = '100%';
+
+  panel.appendChild(container);
+  overlay.appendChild(panel);
+  document.body.appendChild(overlay);
+
+  const teardown = () => {
+    overlay.remove();
+  };
+
+  fastlink.open(
+    {
+      fastLinkURL: session.fastlink_url,
+      accessToken: `Bearer ${session.access_token}`,
+      params: { configName: session.config_name, ...params },
+      onSuccess: (data) => {
+        teardown();
+        onSuccess?.(data);
+      },
+      onError: (data) => {
+        teardown();
+        onError?.(data);
+      },
+      onClose: (data) => {
+        teardown();
+        onClose?.(data);
+      },
+    },
+    containerId,
+  );
+}
+
+/**
+ * Links a new institution through Yodlee FastLink, then persists the resulting
+ * providerAccountId's accounts via /api/yodlee/link/complete.
+ *
+ * Resolves with `{ cancelled: true }` if the user closes FastLink without finishing
+ * (no onSuccess fired), or `{ cancelled: false }` once linking completes. Rejects on
+ * failure.
+ */
+export async function startYodleeLink({ onStatus } = {}) {
+  onStatus?.('Opening Yodlee...');
+  const session = await fetchJson('/api/yodlee/fastlink/session', { method: 'POST' });
+
+  return new Promise((resolve, reject) => {
+    let succeeded = false;
+
+    openYodleeFastlink({
+      session,
+      params: { flow: 'add' },
+      onSuccess: async (data) => {
+        succeeded = true;
+        try {
+          onStatus?.('Link complete. Saving access...');
+          await fetchJson('/api/yodlee/link/complete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ provider_account_id: String(data.providerAccountId) }),
+          });
+          resolve({ cancelled: false });
+        } catch (error) {
+          reject(error);
+        }
+      },
+      onError: (data) => {
+        reject(new Error(data?.reason || data?.message || 'FastLink reported an error.'));
+      },
+      onClose: () => {
+        if (!succeeded) {
+          resolve({ cancelled: true });
+        }
+      },
+    });
+  });
+}
+
+/**
+ * Re-enters credentials for an existing Yodlee-linked institution via FastLink's
+ * "edit" flow, then confirms the reconnect by refreshing one of its accounts.
+ *
+ * Resolves with `{ cancelled: true }` if the user closes FastLink without finishing,
+ * or `{ cancelled: false }` once reconnect + confirmation succeed. Rejects on failure.
+ */
+export async function reconnectYodleeItem({ providerAccountId, accountId, onStatus }) {
+  onStatus?.('Opening Yodlee to reconnect...');
+  const session = await fetchJson('/api/yodlee/fastlink/session', { method: 'POST' });
+
+  return new Promise((resolve, reject) => {
+    let succeeded = false;
+
+    openYodleeFastlink({
+      session,
+      params: { flow: 'edit', providerAccountId },
+      onSuccess: async () => {
+        succeeded = true;
+        try {
+          onStatus?.('Reconnected. Confirming with Yodlee...');
+          await fetchJson(`/api/accounts/${accountId}/refresh`, { method: 'POST' });
+          resolve({ cancelled: false });
+        } catch (error) {
+          reject(error);
+        }
+      },
+      onError: (data) => {
+        reject(new Error(data?.reason || data?.message || 'FastLink reported an error.'));
+      },
+      onClose: () => {
+        if (!succeeded) {
+          resolve({ cancelled: true });
+        }
+      },
+    });
+  });
+}
