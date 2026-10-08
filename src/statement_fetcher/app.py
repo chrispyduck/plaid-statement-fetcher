@@ -49,7 +49,13 @@ from .storage import (
 from .storage import (
     list_sync_jobs as list_persisted_sync_jobs,
 )
-from .sync import RefreshSummary, SyncSummary, refresh_statements, sync_statements
+from .sync import (
+    RefreshSummary,
+    SyncSummary,
+    merge_duplicate_linked_items,
+    refresh_statements,
+    sync_statements,
+)
 from .yodlee_api import YodleeAPIError, YodleeClient
 
 logger = logging.getLogger(__name__)
@@ -412,6 +418,14 @@ def create_app(
         finally:
             set_log_context()
 
+    def merge_duplicate_accounts_unless_syncing() -> None:
+        # A running sync would overwrite the merge's statement re-pointing when it saves
+        # its state; the next sync merges before it starts instead.
+        if has_running_job(ctx.settings, "sync"):
+            logger.info("Sync in progress; deferring duplicate account merge to the next sync")
+            return
+        merge_duplicate_linked_items(ctx.settings, ctx.plaid)
+
     def _frontend_entry() -> FileResponse | dict[str, str]:
         if frontend_index.exists():
             return FileResponse(frontend_index)
@@ -481,6 +495,8 @@ def create_app(
                 details = exc.details or {}
                 message = str(details.get("error_message") or details.get("errorMessage") or exc)
                 failed.append({"item_id": linked_item.item_id, "error": message})
+
+        merge_duplicate_accounts_unless_syncing()
 
         status = "refreshed"
         if failed and results:
@@ -649,6 +665,7 @@ def create_app(
             accounts=_map_plaid_accounts(accounts),
         )
         upsert_linked_item(ctx.settings, linked_item)
+        merge_duplicate_accounts_unless_syncing()
         logger.info(
             "Linked item stored item_id=%s institution=%s accounts=%s",
             item_id,
@@ -698,6 +715,7 @@ def create_app(
             accounts=_map_yodlee_accounts(accounts),
         )
         upsert_linked_item(ctx.settings, linked_item)
+        merge_duplicate_accounts_unless_syncing()
         logger.info(
             "Linked Yodlee item stored item_id=%s institution=%s accounts=%s",
             linked_item.item_id,

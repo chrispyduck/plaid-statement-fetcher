@@ -1,11 +1,16 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 
-from statement_fetcher.models import LinkedAccount, LinkedItem
+from statement_fetcher.models import DownloadedStatement, LinkedAccount, LinkedItem, StateFile
 from statement_fetcher.plaid_api import PlaidAPIError
 from statement_fetcher.settings import Settings
-from statement_fetcher.storage import load_configuration, load_state, upsert_linked_item
+from statement_fetcher.storage import (
+    load_configuration,
+    load_state,
+    save_state,
+    upsert_linked_item,
+)
 from statement_fetcher.sync import refresh_statements, sync_statements
 from statement_fetcher.yodlee_api import YodleeAPIError
 
@@ -488,3 +493,91 @@ def test_sync_flags_yodlee_item_login_required(tmp_path) -> None:
 
     config = load_configuration(settings)
     assert config.linked_items[0].login_required is True
+
+
+class FakeRelinkedPlaidClient:
+    """The new item lists the same statement as before, but under a new statement_id."""
+
+    def __init__(self) -> None:
+        self.removed_tokens: list[str] = []
+        self.download_calls = 0
+
+    def remove_item(self, access_token: str) -> None:
+        self.removed_tokens.append(access_token)
+
+    def list_statements(self, access_token: str) -> dict:
+        assert access_token == "access_new"
+        return {
+            "institution_name": "Chase",
+            "accounts": [
+                {
+                    "account_id": "acc_new",
+                    "account_name": "Everyday Checking",
+                    "statements": [
+                        {"statement_id": "stmt_new", "date_posted": "2026-06-30"},
+                    ],
+                }
+            ],
+        }
+
+    def download_statement(self, access_token: str, statement_id: str) -> tuple[bytes, str | None]:
+        self.download_calls += 1
+        return b"%PDF-1.7 fake", None
+
+
+def test_sync_merges_relinked_item_without_redownloading(tmp_path) -> None:
+    settings = Settings(plaid_env="sandbox", PSF_CONFIG_ROOT=tmp_path)
+    account = {"account_name": "Checking", "account_mask": "0001", "account_type": "depository"}
+    upsert_linked_item(
+        settings,
+        LinkedItem(
+            institution_id="ins_1",
+            institution_name="Chase",
+            item_id="item_old",
+            access_token="access_old",
+            accounts=[LinkedAccount(account_id="acc_old", **account)],
+            created_at=datetime(2026, 7, 1, tzinfo=UTC),
+        ),
+    )
+    save_state(
+        settings,
+        StateFile(
+            environment="sandbox",
+            downloaded_statements=[
+                DownloadedStatement(
+                    statement_id="stmt_old",
+                    institution_name="Chase",
+                    account_id="acc_old",
+                    account_name="Checking",
+                    statement_date=date(2026, 6, 30),
+                    file_path=str(tmp_path / "old.pdf"),
+                    dedupe_key="Chase|acc_old|stmt_old",
+                )
+            ],
+        ),
+    )
+    upsert_linked_item(
+        settings,
+        LinkedItem(
+            institution_id="ins_1",
+            institution_name="Chase",
+            item_id="item_new",
+            access_token="access_new",
+            accounts=[LinkedAccount(account_id="acc_new", **account)],
+            created_at=datetime(2026, 10, 8, tzinfo=UTC),
+        ),
+    )
+
+    client = FakeRelinkedPlaidClient()
+    result = sync_statements(settings, plaid_client=client)
+
+    assert client.removed_tokens == ["access_old"]
+    assert [item.item_id for item in load_configuration(settings).linked_items] == ["item_new"]
+    assert result.downloaded == 0
+    assert result.skipped_existing == 1
+    assert client.download_calls == 0
+    [statement] = load_state(settings).downloaded_statements
+    assert statement.account_id == "acc_new"
+    assert statement.statement_id == "stmt_new"
+    assert statement.dedupe_key == "Chase|acc_new|stmt_new"
+    assert statement.file_path == str(tmp_path / "old.pdf")

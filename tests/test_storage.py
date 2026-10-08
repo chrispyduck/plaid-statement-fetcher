@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import UTC, date, datetime
 
-from statement_fetcher.models import LinkedAccount, LinkedItem
+from statement_fetcher.models import DownloadedStatement, LinkedAccount, LinkedItem, StateFile
 from statement_fetcher.settings import Settings
 from statement_fetcher.storage import (
+    add_event,
     complete_refresh_job,
     complete_sync_job,
     create_sync_job,
@@ -14,9 +16,13 @@ from statement_fetcher.storage import (
     get_latest_job,
     get_sync_job,
     has_running_job,
+    list_events,
     list_sync_jobs,
     load_configuration,
+    load_state,
+    merge_duplicate_accounts,
     remove_account_from_configuration,
+    save_state,
     update_refresh_job_progress,
     update_sync_job_progress,
     upsert_linked_item,
@@ -337,3 +343,166 @@ def test_refresh_and_sync_jobs_are_tracked_independently(tmp_path) -> None:
     assert get_latest_job(settings, "refresh")["job_id"] == "refresh-1"
     assert get_latest_completed_job(settings, "refresh")["job_id"] == "refresh-1"
     assert get_latest_completed_job(settings, "sync") is None
+
+
+def _navy_item(item_id: str, created_at: datetime, accounts: list[LinkedAccount]) -> LinkedItem:
+    return LinkedItem(
+        institution_id="ins_15",
+        institution_name="Navy Federal Credit Union",
+        item_id=item_id,
+        access_token=f"access-{item_id}",
+        accounts=accounts,
+        created_at=created_at,
+    )
+
+
+def test_merge_duplicate_accounts_folds_relinked_item_into_newest(tmp_path) -> None:
+    settings = Settings(plaid_env="sandbox", PSF_CONFIG_ROOT=tmp_path)
+    upsert_linked_item(
+        settings,
+        _navy_item(
+            "item_old",
+            datetime(2026, 7, 1, tzinfo=UTC),
+            [
+                LinkedAccount(
+                    account_id="old_checking",
+                    account_name="EveryDay Checking",
+                    account_mask="8020",
+                    account_type="depository",
+                    account_subtype="checking",
+                    alias="Checking (8020)",
+                ),
+                LinkedAccount(
+                    account_id="old_mortgage",
+                    account_name="Mortgage",
+                    account_type="loan",
+                    account_subtype="mortgage",
+                ),
+            ],
+        ),
+    )
+    # A different login at the same institution that only shares an unmasked name.
+    upsert_linked_item(
+        settings,
+        _navy_item(
+            "item_other_login",
+            datetime(2026, 7, 2, tzinfo=UTC),
+            [
+                LinkedAccount(
+                    account_id="other_mortgage",
+                    account_name="Mortgage",
+                    account_type="loan",
+                    account_subtype="mortgage",
+                ),
+            ],
+        ),
+    )
+    upsert_linked_item(
+        settings,
+        _navy_item(
+            "item_new",
+            datetime(2026, 10, 8, tzinfo=UTC),
+            [
+                LinkedAccount(
+                    account_id="new_checking",
+                    account_name="EveryDay Checking",
+                    account_mask="8020",
+                    account_type="depository",
+                    account_subtype="checking",
+                ),
+                LinkedAccount(
+                    account_id="new_mortgage",
+                    account_name="Mortgage",
+                    account_type="loan",
+                    account_subtype="mortgage",
+                ),
+                LinkedAccount(
+                    account_id="new_savings",
+                    account_name="Finn Savings",
+                    account_mask="6749",
+                    account_type="depository",
+                    account_subtype="savings",
+                ),
+            ],
+        ),
+    )
+    save_state(
+        settings,
+        StateFile(
+            environment="sandbox",
+            downloaded_statements=[
+                DownloadedStatement(
+                    statement_id="stmt_old",
+                    institution_name="Navy Federal Credit Union",
+                    account_id="old_checking",
+                    account_name="Checking (8020)",
+                    statement_date=date(2026, 9, 18),
+                    file_path="/tmp/x.pdf",
+                    dedupe_key="Navy Federal Credit Union|old_checking|stmt_old",
+                )
+            ],
+        ),
+    )
+    add_event(settings, event_type="statement_downloaded", message="x", account_id="old_checking")
+
+    removed = merge_duplicate_accounts(settings)
+
+    assert [item.item_id for item in removed] == ["item_old"]
+    assert removed[0].access_token == "access-item_old"
+
+    config = load_configuration(settings)
+    items = {item.item_id: item for item in config.linked_items}
+    assert set(items) == {"item_new", "item_other_login"}
+    assert [account.account_id for account in items["item_other_login"].accounts] == [
+        "other_mortgage"
+    ]
+    new_accounts = {account.account_id: account for account in items["item_new"].accounts}
+    assert set(new_accounts) == {"new_checking", "new_mortgage", "new_savings"}
+    assert new_accounts["new_checking"].alias == "Checking (8020)"
+
+    [statement] = load_state(settings).downloaded_statements
+    assert statement.account_id == "new_checking"
+    assert statement.dedupe_key == "Navy Federal Credit Union|new_checking|stmt_old"
+    assert any(
+        event["event_type"] == "statement_downloaded"
+        for event in list_events(settings, account_id="new_checking")
+    )
+
+    assert merge_duplicate_accounts(settings) == []
+
+
+def test_merge_duplicate_accounts_keeps_older_item_with_unmatched_accounts(tmp_path) -> None:
+    settings = Settings(plaid_env="sandbox", PSF_CONFIG_ROOT=tmp_path)
+    checking = {
+        "account_name": "Checking",
+        "account_mask": "1708",
+        "account_type": "depository",
+        "account_subtype": "checking",
+    }
+    upsert_linked_item(
+        settings,
+        _navy_item(
+            "item_old",
+            datetime(2026, 7, 1, tzinfo=UTC),
+            [
+                LinkedAccount(account_id="old_checking", **checking),
+                LinkedAccount(
+                    account_id="old_savings", account_name="Savings", account_mask="3009"
+                ),
+            ],
+        ),
+    )
+    upsert_linked_item(
+        settings,
+        _navy_item(
+            "item_new",
+            datetime(2026, 10, 8, tzinfo=UTC),
+            [LinkedAccount(account_id="new_checking", **checking)],
+        ),
+    )
+
+    assert merge_duplicate_accounts(settings) == []
+
+    items = {item.item_id: item for item in load_configuration(settings).linked_items}
+    assert [account.account_id for account in items["item_old"].accounts] == ["old_savings"]
+    assert [account.account_id for account in items["item_new"].accounts] == ["new_checking"]

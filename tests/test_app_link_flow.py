@@ -7,7 +7,7 @@ from datetime import UTC, date, datetime, timedelta
 import httpx
 
 from statement_fetcher.app import create_app, scheduler_tick
-from statement_fetcher.models import DownloadedStatement, StateFile
+from statement_fetcher.models import DownloadedStatement, LinkedAccount, LinkedItem, StateFile
 from statement_fetcher.plaid_api import PlaidAPIError
 from statement_fetcher.settings import Settings
 from statement_fetcher.storage import (
@@ -16,6 +16,7 @@ from statement_fetcher.storage import (
     complete_sync_job,
     create_sync_job,
     save_state,
+    upsert_linked_item,
 )
 
 
@@ -588,3 +589,53 @@ def test_download_statement_rejects_path_outside_output_dir(tmp_path) -> None:
         assert response.status_code == 400
 
     run_with_client(app, test_body)
+
+
+class FakeRelinkPlaidClient(FakePlaidClient):
+    def __init__(self) -> None:
+        self.removed_tokens: list[str] = []
+
+    def remove_item(self, access_token: str) -> None:
+        self.removed_tokens.append(access_token)
+
+
+def test_exchange_merges_accounts_from_earlier_link_of_same_login(tmp_path) -> None:
+    settings = Settings(plaid_env="sandbox", PSF_CONFIG_ROOT=tmp_path)
+    upsert_linked_item(
+        settings,
+        LinkedItem(
+            institution_id="ins_109508",
+            institution_name="Chase",
+            item_id="item-earlier",
+            access_token="access-earlier",
+            accounts=[
+                LinkedAccount(
+                    account_id="acc_earlier",
+                    account_name="Everyday Checking",
+                    account_mask="0001",
+                    account_type="depository",
+                    account_subtype="checking",
+                    alias="Main Checking",
+                )
+            ],
+            created_at=datetime(2026, 7, 1, tzinfo=UTC),
+        ),
+    )
+    plaid_client = FakeRelinkPlaidClient()
+    app = create_app(settings=settings, plaid_client=plaid_client)
+
+    async def test_body(client: httpx.AsyncClient) -> None:
+        exchange_response = await client.post(
+            "/api/plaid/link/exchange",
+            json={"public_token": "public-ok"},
+        )
+        assert exchange_response.status_code == 200
+
+        accounts_response = await client.get("/api/accounts")
+        payload = accounts_response.json()
+        assert [row["account_id"] for row in payload] == ["acc_1"]
+        assert payload[0]["item_id"] == "item-ok"
+        assert payload[0]["alias"] == "Main Checking"
+
+    run_with_client(app, test_body)
+    assert plaid_client.removed_tokens == ["access-earlier"]

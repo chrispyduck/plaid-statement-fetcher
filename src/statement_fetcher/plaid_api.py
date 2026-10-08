@@ -223,6 +223,9 @@ class PlaidClient:
         logo = institution.get("logo")
         return institution_id, name, logo
 
+    def remove_item(self, access_token: str) -> None:
+        self._post("/item/remove", {"access_token": access_token})
+
     def list_statements(self, access_token: str) -> dict[str, Any]:
         return self._post("/statements/list", {"access_token": access_token})
 

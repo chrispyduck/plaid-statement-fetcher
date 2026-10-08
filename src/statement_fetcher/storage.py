@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -399,6 +399,199 @@ def remove_institution_from_configuration(settings: Settings, institution_id: st
             )
         conn.commit()
     return changed
+
+
+def statement_dedupe_key(
+    institution_name: str,
+    account_id: str,
+    statement_date: date,
+    statement_id: str | None,
+) -> str:
+    key_suffix = statement_id or statement_date.isoformat()
+    return f"{institution_name}|{account_id}|{key_suffix}"
+
+
+def _account_match_key(row: sqlite3.Row) -> tuple[str, str, str, str]:
+    """Identify the same real-world account across separately-linked items.
+
+    Providers mint fresh account_ids for every new item, so linking the same login a
+    second time yields different ids for identical accounts. Mask + type/subtype is
+    what stays stable; accounts without a mask (e.g. mortgages) fall back to name.
+    """
+    account_type = row["account_type"] or ""
+    account_subtype = row["account_subtype"] or ""
+    if row["account_mask"]:
+        return ("mask", account_type, account_subtype, row["account_mask"])
+    return ("name", account_type, account_subtype, row["account_name"].strip().casefold())
+
+
+def merge_duplicate_accounts(settings: Settings) -> list[LinkedItem]:
+    """Fold accounts duplicated across items at the same institution into the newest item.
+
+    Linking an institution again through a fresh Link/FastLink session (instead of
+    reconnecting the existing item) creates a second item whose accounts duplicate the
+    first one's. For each duplicate, the newer item's account wins: it inherits the
+    older account's alias, downloaded statements and events, and the older account is
+    removed. Older items left with no accounts are deleted and returned so the caller
+    can also remove them at the provider.
+
+    Two items are only treated as the same login when they share at least one account
+    by mask, so that unrelated logins at one institution don't get merged on account
+    names alone. Downloaded statements keep their old statement_id here; sync adopts
+    them under the new item's statement_ids (see `_adopt_reissued_statements`).
+    """
+    ensure_environment_files(settings)
+    with _connect(settings) as conn:
+        items = conn.execute(
+            """
+            SELECT
+                item_id,
+                provider,
+                institution_id,
+                institution_name,
+                institution_logo,
+                access_token,
+                created_at,
+                updated_at
+            FROM linked_items
+            ORDER BY created_at, item_id
+            """
+        ).fetchall()
+        account_rows = conn.execute(
+            """
+            SELECT account_id, item_id, account_name, account_mask, account_type,
+                   account_subtype, alias
+            FROM linked_accounts
+            """
+        ).fetchall()
+
+        rows_by_item: dict[str, list[sqlite3.Row]] = {}
+        for row in account_rows:
+            rows_by_item.setdefault(row["item_id"], []).append(row)
+        # Keys shared by two accounts within one item are ambiguous; never match on them.
+        accounts_by_key: dict[str, dict[tuple[str, str, str, str], sqlite3.Row]] = {}
+        for item_id, rows in rows_by_item.items():
+            keys = [_account_match_key(row) for row in rows]
+            accounts_by_key[item_id] = {
+                key: row for key, row in zip(keys, rows, strict=True) if keys.count(key) == 1
+            }
+
+        merges: list[tuple[sqlite3.Row, sqlite3.Row]] = []
+        merged_account_ids: set[str] = set()
+        for index, older in enumerate(items):
+            older_accounts = accounts_by_key.get(older["item_id"], {})
+            # Newest first, so each duplicate goes straight to its final home.
+            for newer in reversed(items[index + 1 :]):
+                if (newer["provider"], newer["institution_id"]) != (
+                    older["provider"],
+                    older["institution_id"],
+                ):
+                    continue
+                newer_accounts = accounts_by_key.get(newer["item_id"], {})
+                shared_keys = older_accounts.keys() & newer_accounts.keys()
+                if not any(key[0] == "mask" for key in shared_keys):
+                    continue
+                for key in sorted(shared_keys):
+                    source = older_accounts[key]
+                    if source["account_id"] in merged_account_ids:
+                        continue
+                    merged_account_ids.add(source["account_id"])
+                    merges.append((source, newer_accounts[key]))
+
+        if not merges:
+            return []
+
+        for source, target in merges:
+            source_id = source["account_id"]
+            target_id = target["account_id"]
+            if source["alias"] is not None:
+                conn.execute(
+                    "UPDATE linked_accounts SET alias = ? WHERE account_id = ? AND alias IS NULL",
+                    (source["alias"], target_id),
+                )
+            statement_rows = conn.execute(
+                """
+                SELECT dedupe_key, statement_id, institution_name, statement_date
+                FROM downloaded_statements
+                WHERE account_id = ?
+                """,
+                (source_id,),
+            ).fetchall()
+            for statement in statement_rows:
+                conn.execute(
+                    """
+                    UPDATE OR IGNORE downloaded_statements
+                    SET account_id = ?, dedupe_key = ?
+                    WHERE dedupe_key = ?
+                    """,
+                    (
+                        target_id,
+                        statement_dedupe_key(
+                            statement["institution_name"],
+                            target_id,
+                            date.fromisoformat(statement["statement_date"]),
+                            statement["statement_id"],
+                        ),
+                        statement["dedupe_key"],
+                    ),
+                )
+            # Anything left collided with a record the target account already has.
+            conn.execute("DELETE FROM downloaded_statements WHERE account_id = ?", (source_id,))
+            conn.execute(
+                "UPDATE events SET account_id = ? WHERE account_id = ?",
+                (target_id, source_id),
+            )
+            conn.execute("DELETE FROM linked_accounts WHERE account_id = ?", (source_id,))
+            _add_event_with_connection(
+                conn,
+                event_type="account_merged",
+                message="Duplicate account from an older link merged into this account",
+                account_id=target_id,
+                item_id=target["item_id"],
+                metadata={
+                    "merged_account_id": source_id,
+                    "merged_item_id": source["item_id"],
+                    "account_name": target["account_name"],
+                    "account_mask": target["account_mask"],
+                },
+            )
+
+        removed_items: list[LinkedItem] = []
+        source_item_ids = {source["item_id"] for source, _ in merges}
+        for item in items:
+            if item["item_id"] not in source_item_ids:
+                continue
+            remaining = conn.execute(
+                "SELECT COUNT(*) FROM linked_accounts WHERE item_id = ?",
+                (item["item_id"],),
+            ).fetchone()[0]
+            if remaining:
+                continue
+            conn.execute("DELETE FROM linked_items WHERE item_id = ?", (item["item_id"],))
+            _add_event_with_connection(
+                conn,
+                event_type="item_superseded",
+                message="Institution item removed after its accounts were merged into a newer link",
+                item_id=item["item_id"],
+                metadata={
+                    "institution_id": item["institution_id"],
+                    "institution_name": item["institution_name"],
+                },
+            )
+            removed_items.append(
+                LinkedItem(
+                    provider=item["provider"],
+                    institution_id=item["institution_id"],
+                    institution_name=item["institution_name"],
+                    institution_logo=item["institution_logo"],
+                    item_id=item["item_id"],
+                    access_token=decrypt_value(item["access_token"], settings.encryption_secret),
+                    created_at=datetime.fromisoformat(item["created_at"]),
+                    updated_at=datetime.fromisoformat(item["updated_at"]),
+                )
+            )
+        conn.commit()
+    return removed_items
 
 
 def upsert_linked_item(settings: Settings, linked_item: LinkedItem) -> None:

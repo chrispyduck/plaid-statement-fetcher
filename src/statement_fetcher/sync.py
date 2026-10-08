@@ -12,11 +12,18 @@ from functools import partial
 from pathlib import Path
 
 from .logging_utils import set_log_context
-from .models import DownloadedStatement, LinkedItem
+from .models import DownloadedStatement, LinkedItem, StateFile
 from .plaid_api import PlaidClient
 from .provider_errors import ProviderAPIError
 from .settings import Settings
-from .storage import load_configuration, load_state, save_state, set_item_login_required
+from .storage import (
+    load_configuration,
+    load_state,
+    merge_duplicate_accounts,
+    save_state,
+    set_item_login_required,
+    statement_dedupe_key,
+)
 from .yodlee_api import YodleeClient
 
 logger = logging.getLogger(__name__)
@@ -71,14 +78,89 @@ def _statement_date(statement: dict) -> date:
     return date(int(statement["year"]), int(statement["month"]), 1)
 
 
-def _dedupe_key(
-    institution_name: str,
+def merge_duplicate_linked_items(settings: Settings, plaid: PlaidClient) -> list[LinkedItem]:
+    """Merge accounts duplicated by re-linking an institution, then drop superseded items.
+
+    Must not run while a sync job is in flight: sync rewrites downloaded_statements
+    wholesale when it finishes, which would undo the re-pointing done here.
+    """
+    removed_items = merge_duplicate_accounts(settings)
+    for item in removed_items:
+        logger.info(
+            "Removed superseded linked item item_id=%s institution=%s provider=%s",
+            item.item_id,
+            item.institution_name,
+            item.provider,
+        )
+        if item.provider != "plaid":
+            continue
+        # Best-effort: the item is already gone locally, this just stops Plaid from
+        # keeping (and billing for) a connection nothing uses any more.
+        try:
+            plaid.remove_item(item.access_token)
+        except ProviderAPIError as exc:
+            logger.warning(
+                "Removing superseded item at Plaid failed item_id=%s: %s", item.item_id, exc
+            )
+    return removed_items
+
+
+def _adopt_reissued_statements(
     account_id: str,
-    statement_date: date,
-    statement_id: str | None,
-) -> str:
-    key_suffix = statement_id or statement_date.isoformat()
-    return f"{institution_name}|{account_id}|{key_suffix}"
+    account_statements: list[dict],
+    institution_name: str,
+    state: StateFile,
+    existing_entries: dict[str, DownloadedStatement],
+    existing_keys: set[str],
+) -> None:
+    """Re-key already-downloaded statements whose statement_id the provider has changed.
+
+    Statement ids are scoped to the provider item, so once a re-linked item has replaced
+    an older one (see `merge_duplicate_accounts`), every statement comes back under a new
+    id. A listed statement that isn't known yet is matched to a downloaded record for the
+    same account and date whose id is no longer listed; if exactly one such record
+    exists it's the same statement, so it's re-keyed instead of downloaded again.
+    """
+    listed_ids = {
+        statement.get("statement_id")
+        for statement in account_statements
+        if statement.get("statement_id")
+    }
+    stale_by_date: dict[date, list[DownloadedStatement]] = {}
+    for entry in state.downloaded_statements:
+        if entry.account_id == account_id and entry.statement_id not in listed_ids:
+            stale_by_date.setdefault(entry.statement_date, []).append(entry)
+    if not stale_by_date:
+        return
+
+    for statement in account_statements:
+        statement_id = statement.get("statement_id")
+        if not statement_id:
+            continue
+        statement_date = _statement_date(statement)
+        dedupe_key = statement_dedupe_key(
+            institution_name, account_id, statement_date, statement_id
+        )
+        if dedupe_key in existing_keys:
+            continue
+        candidates = stale_by_date.get(statement_date) or []
+        if len(candidates) != 1:
+            continue
+        entry = candidates.pop()
+        logger.info(
+            "Adopting downloaded statement under new statement_id account_id=%s date=%s "
+            "old_statement_id=%s new_statement_id=%s",
+            account_id,
+            statement_date,
+            entry.statement_id,
+            statement_id,
+        )
+        existing_keys.discard(entry.dedupe_key)
+        existing_entries.pop(entry.dedupe_key, None)
+        entry.statement_id = statement_id
+        entry.dedupe_key = dedupe_key
+        existing_keys.add(dedupe_key)
+        existing_entries[dedupe_key] = entry
 
 
 def _build_output_path(
@@ -332,6 +414,9 @@ def sync_statements(
     plaid = plaid_client or PlaidClient(settings)
     yodlee = yodlee_client or YodleeClient(settings)
 
+    if not dry_run:
+        merge_duplicate_linked_items(settings, plaid)
+
     config = load_configuration(settings)
     state = load_state(settings)
     existing_keys = {entry.dedupe_key for entry in state.downloaded_statements}
@@ -426,6 +511,14 @@ def sync_statements(
             source_name = response_account.get("account_name") or "Unknown Account"
             chosen_name = account_aliases.get(response_account_id) or source_name
             account_statements = response_account.get("statements") or []
+            _adopt_reissued_statements(
+                response_account_id,
+                account_statements,
+                institution_name,
+                state,
+                existing_entries,
+                existing_keys,
+            )
 
             listed_for_account = 0
             new_for_account = 0
@@ -437,7 +530,7 @@ def sync_statements(
                     continue
                 listed_for_account += 1
                 statement_date = _statement_date(statement)
-                dedupe_key = _dedupe_key(
+                dedupe_key = statement_dedupe_key(
                     institution_name,
                     response_account_id,
                     statement_date,
@@ -516,7 +609,7 @@ def sync_statements(
                         progress_callback(summary)
                     continue
 
-                dedupe_key = _dedupe_key(
+                dedupe_key = statement_dedupe_key(
                     institution_name,
                     response_account_id,
                     statement_date,
